@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "binance": {
+      "command": "uv",
+      "args": ["run", "python", "/Users/maxalekhnovich/Code/dbt-bootcamp/arbitrage/binance_mcp_server.py"]
+    }
+  }
+}

@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+
+# Environment variables (CRITICAL - contains secrets)
+.env
+.env.*
+*.env
+.envrc
+
+# Logs and data files
+logs/
+*.log
+
+# IDE and editor files
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Trading data (optional - remove if you want to keep backtest results)
+trades_*.json
+signals_*.json
+backtest_*.json
