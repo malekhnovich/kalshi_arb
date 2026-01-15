@@ -42,9 +42,10 @@ class PriceUpdateEvent(BaseEvent):
     price: float = 0.0
     volume_24h: float = 0.0
     price_change_24h: float = 0.0
-    momentum_up_pct: float = 0.0  # % of recent candles that are up
+    momentum_up_pct: float = 0.0  # % of recent candles that are up (volume-weighted)
     momentum_window_minutes: int = 60
     candles_analyzed: int = 0
+    trend_confirmed: bool = False  # True if price making higher highs/lows in direction
 
     def __post_init__(self):
         self.event_type = EventType.PRICE_UPDATE

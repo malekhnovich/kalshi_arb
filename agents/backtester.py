@@ -272,13 +272,52 @@ class BacktestAgent(BaseAgent):
         window_start = max(0, index - config.MOMENTUM_WINDOW)
         recent_candles = self._klines[window_start : index + 1]
 
-        candles_up = sum(
-            1 for k in recent_candles if float(k[4]) >= float(k[1])
-        )
-        momentum = (candles_up / len(recent_candles) * 100) if recent_candles else 50
+        # Calculate hybrid momentum (matching price_monitor.py)
+        simple_up = 0
+        weighted_up = 0.0
+        weighted_down = 0.0
+
+        for k in recent_candles:
+            open_price = float(k[1])
+            close_price_k = float(k[4])
+            volume = float(k[5])
+
+            is_up = close_price_k >= open_price
+            if is_up:
+                simple_up += 1
+
+            if open_price > 0 and volume > 0:
+                magnitude = abs(close_price_k - open_price) / open_price
+                weight = volume * (magnitude + 0.0001)
+
+                if is_up:
+                    weighted_up += weight
+                else:
+                    weighted_down += weight
+
+        total_candles = len(recent_candles)
+        total_weight = weighted_up + weighted_down
+
+        # Hybrid: 70% volume-weighted + 30% simple count
+        simple_pct = (simple_up / total_candles * 100) if total_candles > 0 else 50
+        volume_pct = (weighted_up / total_weight * 100) if total_weight > 0 else 50
+        momentum = 0.7 * volume_pct + 0.3 * simple_pct
 
         close_price = float(kline[4])
         timestamp = datetime.fromtimestamp(kline[0] / 1000)
+
+        # Calculate price trend confirmation
+        prices = [float(k[4]) for k in recent_candles]
+        trend_confirmed = False
+        if len(prices) >= 20:
+            recent_high = max(prices[-10:])
+            older_high = max(prices[-20:-10])
+            recent_low = min(prices[-10:])
+            older_low = min(prices[-20:-10])
+
+            uptrend = recent_high > older_high and recent_low > older_low
+            downtrend = recent_high < older_high and recent_low < older_low
+            trend_confirmed = (momentum >= 60 and uptrend) or (momentum <= 40 and downtrend)
 
         # Emit price update
         price_event = PriceUpdateEvent(
@@ -290,6 +329,7 @@ class BacktestAgent(BaseAgent):
             momentum_up_pct=round(momentum, 2),
             momentum_window_minutes=config.MOMENTUM_WINDOW,
             candles_analyzed=len(recent_candles),
+            trend_confirmed=trend_confirmed,
         )
         await self.publish(price_event)
 

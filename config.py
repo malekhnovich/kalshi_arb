@@ -60,6 +60,12 @@ POLL_INTERVAL_KALSHI = _get_env_int("POLL_INTERVAL_KALSHI", 10)  # seconds
 # Env: KALSHI_CRYPTO_SERIES (comma-separated)
 KALSHI_CRYPTO_SERIES = _get_env_list("KALSHI_CRYPTO_SERIES", ["KXBTC", "KXETH"])
 
+# Kalshi API Authentication (for historical data access)
+# Env: KALSHI_API_KEY
+KALSHI_API_KEY = _get_env_str("KALSHI_API_KEY", "")
+# Env: KALSHI_PRIVATE_KEY_PATH (path to private key file for RSA signing)
+KALSHI_PRIVATE_KEY_PATH = _get_env_str("KALSHI_PRIVATE_KEY_PATH", "")
+
 # Analysis Configuration
 # Env: MOMENTUM_WINDOW
 MOMENTUM_WINDOW = _get_env_int("MOMENTUM_WINDOW", 60)  # minutes to analyze for momentum

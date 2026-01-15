@@ -36,3 +36,5 @@ logs/
 trades_*.json
 signals_*.json
 backtest_*.json
+
+private_key.pem

@@ -35,6 +35,7 @@ class ArbitrageDetectorAgent(BaseAgent):
         self._price_data: Dict[str, PriceUpdateEvent] = {}
         self._kalshi_data: Dict[str, KalshiOddsEvent] = {}
         self._last_signal_time: Dict[str, datetime] = {}
+        self._momentum_history: Dict[str, list] = {}  # Track momentum for acceleration
 
         # Configurable thresholds
         self.confidence_threshold = config.CONFIDENCE_THRESHOLD
@@ -103,26 +104,68 @@ class ArbitrageDetectorAgent(BaseAgent):
 
         momentum = price_event.momentum_up_pct
         yes_price = kalshi_event.yes_price
+        symbol = price_event.symbol
+
+        # IMPROVEMENT 2: Track momentum history for acceleration check
+        if symbol not in self._momentum_history:
+            self._momentum_history[symbol] = []
+        self._momentum_history[symbol].append(momentum)
+        if len(self._momentum_history[symbol]) > 5:
+            self._momentum_history[symbol].pop(0)
+
+        # Check momentum acceleration - skip if momentum is decelerating
+        history = self._momentum_history[symbol]
+        is_accelerating = True
+        if len(history) >= 3:
+            recent_avg = sum(history[-2:]) / 2
+            older_avg = sum(history[:-2]) / max(1, len(history) - 2)
+            # For bullish: recent should be higher; for bearish: recent should be lower
+            if momentum >= 50:
+                is_accelerating = recent_avg >= older_avg - 2  # Allow small decel
+            else:
+                is_accelerating = recent_avg <= older_avg + 2
 
         # Determine if spot shows strong direction
         strong_up = momentum >= self.confidence_threshold
         strong_down = momentum <= (100 - self.confidence_threshold)
 
-        # Check if Kalshi odds are neutral (mispriced)
-        odds_neutral = self.neutral_range[0] <= yes_price <= self.neutral_range[1]
+        # IMPROVEMENT 4: Trend confirmation as confidence boost (not hard filter)
+        trend_bonus = 5.0 if price_event.trend_confirmed else 0.0
 
-        # Calculate expected odds based on spot momentum
-        # If 80% of candles are up, we'd expect yes odds around 70-80
+        # Calculate expected spread first (needed for dynamic range)
         expected_odds = momentum if strong_up else (100 - momentum)
+        spread = abs(expected_odds - yes_price)
+
+        # IMPROVEMENT 3: Dynamic neutral range based on spread size
+        # Larger spreads = more tolerance, smaller spreads = stricter
+        if spread >= 25:
+            neutral_range = (40, 60)  # Wide range for huge edges
+        elif spread >= 15:
+            neutral_range = (45, 55)  # Standard range
+        else:
+            neutral_range = (47, 53)  # Tight range for small edges
+
+        # Check if Kalshi odds are neutral (mispriced)
+        odds_neutral = neutral_range[0] <= yes_price <= neutral_range[1]
 
         # Arbitrage exists if spot is directional but odds are neutral
-        if (strong_up or strong_down) and odds_neutral:
+        if (strong_up or strong_down) and odds_neutral and is_accelerating:
             direction = "UP" if strong_up else "DOWN"
-            spread = abs(expected_odds - yes_price)
 
             # Only signal if spread is significant
             if spread >= self.min_odds_spread:
-                confidence = min(momentum if strong_up else (100 - momentum), 95)
+                # IMPROVEMENT 5: Scale confidence by edge quality
+                base_confidence = momentum if strong_up else (100 - momentum)
+
+                # Boost for larger spreads (more mispricing = higher confidence)
+                spread_bonus = min(spread / 30 * 10, 10)  # Up to +10 for 30c+ spread
+
+                # Boost if odds are very neutral (closer to 50 = more mispriced)
+                center_distance = abs(yes_price - 50)
+                neutrality_bonus = max(0, (5 - center_distance) / 5 * 5)  # +5 if at 50
+
+                # Combine factors (including trend bonus from improvement 4)
+                confidence = min(base_confidence + spread_bonus + neutrality_bonus + trend_bonus, 95)
 
                 recommendation = self._generate_recommendation(
                     direction, kalshi_event, yes_price, momentum

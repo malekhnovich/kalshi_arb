@@ -129,12 +129,51 @@ class PriceMonitorAgent(BaseAgent):
             if not klines:
                 return
 
-            # Calculate momentum
-            candles_up = sum(
-                1 for k in klines if float(k[4]) >= float(k[1])  # close >= open
-            )
+            # Calculate hybrid momentum: combines simple count with volume weighting
+            # This avoids edge cases where low volatility gives 0% momentum
+            simple_up = 0
+            weighted_up = 0.0
+            weighted_down = 0.0
+
+            for k in klines:
+                open_price = float(k[1])
+                close_price = float(k[4])
+                volume = float(k[5])
+
+                is_up = close_price >= open_price
+                if is_up:
+                    simple_up += 1
+
+                # Calculate magnitude as % move, weighted by volume
+                if open_price > 0 and volume > 0:
+                    magnitude = abs(close_price - open_price) / open_price
+                    weight = volume * (magnitude + 0.0001)  # Small floor to avoid zero
+
+                    if is_up:
+                        weighted_up += weight
+                    else:
+                        weighted_down += weight
+
             total_candles = len(klines)
-            momentum_up_pct = (candles_up / total_candles * 100) if total_candles else 0
+            total_weight = weighted_up + weighted_down
+
+            # Hybrid: 70% volume-weighted + 30% simple count
+            simple_pct = (simple_up / total_candles * 100) if total_candles > 0 else 50
+            volume_pct = (weighted_up / total_weight * 100) if total_weight > 0 else 50
+            momentum_up_pct = 0.7 * volume_pct + 0.3 * simple_pct
+
+            # Calculate price trend confirmation (higher highs/lows)
+            prices = [float(k[4]) for k in klines]
+            trend_confirmed = False
+            if len(prices) >= 20:
+                recent_high = max(prices[-10:])
+                older_high = max(prices[-20:-10])
+                recent_low = min(prices[-10:])
+                older_low = min(prices[-20:-10])
+
+                uptrend = recent_high > older_high and recent_low > older_low
+                downtrend = recent_high < older_high and recent_low < older_low
+                trend_confirmed = (momentum_up_pct >= 60 and uptrend) or (momentum_up_pct <= 40 and downtrend)
 
             # Get latest price and 24h stats
             ticker = await self.client.get_ticker(symbol)
@@ -146,7 +185,8 @@ class PriceMonitorAgent(BaseAgent):
                 price_change_24h=float(ticker.get("priceChangePercent", 0)),
                 momentum_up_pct=round(momentum_up_pct, 2),
                 momentum_window_minutes=self.momentum_window,
-                candles_analyzed=total_candles
+                candles_analyzed=total_candles,
+                trend_confirmed=trend_confirmed
             )
 
             await self.publish(event)
