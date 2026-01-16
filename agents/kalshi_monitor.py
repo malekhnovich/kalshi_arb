@@ -1,5 +1,11 @@
 """
 Kalshi Monitor Agent - Tracks Kalshi prediction market odds for crypto events.
+
+Supports two modes:
+1. WebSocket (preferred): Real-time streaming with sub-second updates
+2. Polling (fallback): REST API polling every 10 seconds
+
+The agent automatically falls back to polling if WebSocket is unavailable.
 """
 
 import asyncio
@@ -11,6 +17,13 @@ import httpx
 from .base import BaseAgent, retry_with_backoff, CircuitBreaker
 from events import EventBus, KalshiOddsEvent
 import config
+
+# Try to import WebSocket client
+try:
+    from .kalshi_websocket import KalshiWebSocketClient, WEBSOCKETS_AVAILABLE
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
+    KalshiWebSocketClient = None
 
 
 class ResilientHttpClient:
@@ -121,21 +134,142 @@ class KalshiMonitorAgent(BaseAgent):
 
     Tracks markets related to cryptocurrency price predictions
     (e.g., "Will BTC be above $100k by end of month?").
+
+    Supports WebSocket for real-time updates with automatic fallback to polling.
     """
 
-    def __init__(self, event_bus: EventBus):
+    def __init__(self, event_bus: EventBus, use_websocket: bool = True):
         super().__init__("KalshiMonitor", event_bus)
         self.client = KalshiClient()
         self.poll_interval = config.POLL_INTERVAL_KALSHI
         self.crypto_series = config.KALSHI_CRYPTO_SERIES
         self._last_markets: Dict[str, Dict] = {}
 
-    async def run(self) -> None:
-        """Poll Kalshi markets and emit events"""
-        for series in self.crypto_series:
-            await self._fetch_and_emit_series(series)
+        # WebSocket support
+        self._use_websocket = use_websocket and WEBSOCKETS_AVAILABLE and config.KALSHI_WS_ENABLED
+        self._ws_client: Optional[KalshiWebSocketClient] = None
+        self._ws_connected = False
+        self._ws_subscribed_markets: set = set()
 
-        await asyncio.sleep(self.poll_interval)
+        # Mode tracking
+        self._mode = "initializing"  # "websocket", "polling", "initializing"
+
+    async def on_start(self) -> None:
+        """Initialize connection - try WebSocket first, fall back to polling."""
+        if self._use_websocket:
+            await self._init_websocket()
+        else:
+            self._mode = "polling"
+            print(f"[{self.name}] Using polling mode (interval: {self.poll_interval}s)")
+
+    async def on_stop(self) -> None:
+        """Cleanup WebSocket connection on stop."""
+        if self._ws_client and self._ws_connected:
+            await self._ws_client.disconnect()
+            self._ws_connected = False
+
+    async def _init_websocket(self) -> None:
+        """Initialize WebSocket connection."""
+        try:
+            self._ws_client = KalshiWebSocketClient()
+            self._ws_client.register_handler("ticker", self._handle_ws_ticker)
+
+            if await self._ws_client.connect():
+                self._ws_connected = True
+                self._mode = "websocket"
+                print(f"[{self.name}] WebSocket connected - real-time mode active")
+
+                # Fetch markets and subscribe
+                await self._subscribe_to_markets()
+            else:
+                print(f"[{self.name}] WebSocket failed - falling back to polling")
+                self._mode = "polling"
+        except Exception as e:
+            print(f"[{self.name}] WebSocket init error: {e} - falling back to polling")
+            self._mode = "polling"
+
+    async def _subscribe_to_markets(self) -> None:
+        """Subscribe to markets via WebSocket."""
+        if not self._ws_client or not self._ws_connected:
+            return
+
+        for series in self.crypto_series:
+            try:
+                markets = await self.client.get_markets(series_ticker=series, status="open")
+                tickers = [m.get("ticker") for m in markets if m.get("ticker")]
+
+                if tickers:
+                    await self._ws_client.subscribe("ticker", tickers)
+                    self._ws_subscribed_markets.update(tickers)
+                    print(f"[{self.name}] Subscribed to {len(tickers)} markets for {series}")
+            except Exception as e:
+                print(f"[{self.name}] Failed to subscribe to {series}: {e}")
+
+    async def _handle_ws_ticker(self, message: Dict[str, Any]) -> None:
+        """Handle ticker updates from WebSocket and publish events."""
+        try:
+            data = message.get("msg", {})
+            market_ticker = data.get("ticker") or data.get("market_ticker", "")
+
+            if not market_ticker:
+                return
+
+            # Extract pricing data
+            yes_price = data.get("yes_price", data.get("yes_ask", 50))
+            no_price = data.get("no_price", data.get("no_ask", 50))
+
+            # Determine underlying symbol
+            underlying = self._extract_underlying_from_ticker(market_ticker)
+
+            event = KalshiOddsEvent(
+                market_ticker=market_ticker,
+                market_title=data.get("title", ""),
+                yes_price=float(yes_price),
+                no_price=float(no_price),
+                volume=int(data.get("volume", 0)),
+                open_interest=int(data.get("open_interest", 0)),
+                underlying_symbol=underlying,
+                strike_price=None,
+                expiration=None,
+            )
+
+            await self.publish(event)
+
+        except Exception as e:
+            print(f"[{self.name}] WS ticker handler error: {e}")
+
+    def _extract_underlying_from_ticker(self, ticker: str) -> str:
+        """Extract underlying asset from market ticker."""
+        for series in self.crypto_series:
+            if ticker.startswith(series):
+                return series[2:] if series.startswith("KX") else series
+        return ""
+
+    async def run(self) -> None:
+        """Main loop - handles both WebSocket and polling modes."""
+        if self._mode == "websocket":
+            # In WebSocket mode, check connection health
+            if self._ws_client and not self._ws_client.is_connected:
+                print(f"[{self.name}] WebSocket disconnected - attempting reconnect")
+                self._ws_connected = False
+                await self._init_websocket()
+
+            # WebSocket handles data push - just sleep
+            await asyncio.sleep(5)
+        else:
+            # Polling mode - fetch and emit
+            for series in self.crypto_series:
+                await self._fetch_and_emit_series(series)
+
+            await asyncio.sleep(self.poll_interval)
+
+    def get_mode(self) -> str:
+        """Return current operating mode."""
+        return self._mode
+
+    def get_subscribed_count(self) -> int:
+        """Return count of subscribed markets."""
+        return len(self._ws_subscribed_markets)
 
     async def _fetch_and_emit_series(self, series_ticker: str) -> None:
         """Fetch markets for a series and emit events"""

@@ -2,10 +2,18 @@
 Trader Agent - Executes trades on Kalshi based on arbitrage signals.
 
 Supports dry-run mode for paper trading without real execution.
+
+SAFETY: Live trading is DISABLED by default and requires multiple safety gates:
+1. KALSHI_ENABLE_LIVE_TRADING=true environment variable
+2. ./ENABLE_LIVE_TRADING file must exist
+3. --live flag passed to CLI
+4. Interactive confirmation prompt
 """
 
 import asyncio
+import base64
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,6 +30,14 @@ from events import (
     AlertEvent,
 )
 import config
+
+# Try to import cryptography for RSA-PSS signing
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
 
 
 @dataclass
@@ -142,12 +158,68 @@ class TradingStats:
         }
 
 
+class KalshiAuthenticator:
+    """RSA-PSS authenticator for Kalshi API requests."""
+
+    def __init__(self, api_key: str, private_key_path: str):
+        if not CRYPTO_AVAILABLE:
+            raise ImportError("cryptography library required for authentication")
+
+        self.api_key = api_key
+        self._private_key = None
+
+        # Load private key
+        if private_key_path and Path(private_key_path).exists():
+            with open(private_key_path, "rb") as f:
+                self._private_key = serialization.load_pem_private_key(
+                    f.read(), password=None
+                )
+
+    def sign_request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[str] = None
+    ) -> Dict[str, str]:
+        """Generate authentication headers for a request."""
+        if not self._private_key:
+            raise ValueError("Private key not loaded")
+
+        timestamp = str(int(time.time() * 1000))
+
+        # Message to sign: timestamp + method + path + body
+        message = timestamp + method.upper() + path
+        if body:
+            message += body
+
+        # Sign with RSA-PSS
+        signature = self._private_key.sign(
+            message.encode("utf-8"),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+            "Content-Type": "application/json",
+        }
+
+
 class KalshiTradingClient:
     """
-    Kalshi trading client with dry-run support.
+    Kalshi trading client with dry-run support and safety gates.
 
-    In dry-run mode, simulates order execution without hitting the API.
-    In live mode, would execute real trades (requires authentication).
+    SAFETY: Live trading requires ALL of these to be true:
+    1. dry_run=False passed to constructor
+    2. config.is_live_trading_allowed() returns True
+    3. API credentials are valid
+
+    In dry-run mode (default), simulates order execution.
     """
 
     def __init__(
@@ -155,12 +227,109 @@ class KalshiTradingClient:
         base_url: str = config.KALSHI_API_URL,
         dry_run: bool = True,
         api_key: Optional[str] = None,
+        private_key_path: Optional[str] = None,
     ):
         self.base_url = base_url
         self.dry_run = dry_run
-        self.api_key = api_key
+        self.api_key = api_key or config.KALSHI_API_KEY
+        self.private_key_path = private_key_path or config.KALSHI_PRIVATE_KEY_PATH
         self.timeout = 15.0
         self._order_counter = 0
+
+        # Initialize authenticator for read operations (balance/positions)
+        self._authenticator: Optional[KalshiAuthenticator] = None
+        if self.api_key and self.private_key_path and CRYPTO_AVAILABLE:
+            try:
+                self._authenticator = KalshiAuthenticator(
+                    self.api_key, self.private_key_path
+                )
+            except Exception as e:
+                print(f"[TradingClient] Auth init failed: {e}")
+
+    def _check_safety_gates(self) -> tuple[bool, str]:
+        """
+        Check all safety gates before allowing live trading.
+
+        Returns (allowed, reason) tuple.
+        """
+        if self.dry_run:
+            return False, "dry_run mode enabled"
+
+        if not config.is_live_trading_allowed():
+            status = config.get_live_trading_status()
+            if not status["env_var_set"]:
+                return False, "KALSHI_ENABLE_LIVE_TRADING env var not set to 'true'"
+            if not status["enable_file_exists"]:
+                return False, "./ENABLE_LIVE_TRADING file does not exist"
+            if not status["not_in_ci"]:
+                return False, "Running in CI environment"
+            if not status["no_kill_switch"]:
+                return False, "./STOP_TRADING kill switch active"
+            return False, "Unknown safety gate failure"
+
+        if not self._authenticator:
+            return False, "API credentials not configured"
+
+        return True, "all gates passed"
+
+    async def get_balance(self) -> Dict[str, Any]:
+        """
+        Get account balance - READ ONLY, always safe.
+
+        Returns balance in cents and portfolio value.
+        """
+        if not self._authenticator:
+            return {"success": False, "error": "Not authenticated"}
+
+        endpoint = "/portfolio/balance"
+        try:
+            headers = self._authenticator.sign_request("GET", endpoint)
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers
+                )
+                response.raise_for_status()
+                data = response.json()
+                return {
+                    "success": True,
+                    "balance_cents": data.get("balance", 0),
+                    "balance_dollars": data.get("balance", 0) / 100,
+                    "portfolio_value_cents": data.get("portfolio_value", 0),
+                    "portfolio_value_dollars": data.get("portfolio_value", 0) / 100,
+                }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_positions(self, ticker: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get current positions - READ ONLY, always safe.
+        """
+        if not self._authenticator:
+            return {"success": False, "error": "Not authenticated", "positions": []}
+
+        endpoint = "/portfolio/positions"
+        params = {}
+        if ticker:
+            params["ticker"] = ticker
+
+        try:
+            headers = self._authenticator.sign_request("GET", endpoint)
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers,
+                    params=params
+                )
+                response.raise_for_status()
+                data = response.json()
+                return {
+                    "success": True,
+                    "market_positions": data.get("market_positions", []),
+                    "event_positions": data.get("event_positions", []),
+                }
+        except Exception as e:
+            return {"success": False, "error": str(e), "positions": []}
 
     async def place_order(
         self,
@@ -172,17 +341,17 @@ class KalshiTradingClient:
         """
         Place an order on Kalshi.
 
-        In dry-run mode, simulates order fill immediately.
-        In live mode, would submit to Kalshi API.
+        SAFETY: In dry-run mode (default), simulates order fill.
+        Live trading requires ALL safety gates to pass.
         """
         self._order_counter += 1
-        order_id = f"DRY-{self._order_counter:06d}" if self.dry_run else None
 
+        # Always check safety gates first
         if self.dry_run:
             # Simulate immediate fill
             return {
                 "success": True,
-                "order_id": order_id,
+                "order_id": f"DRY-{self._order_counter:06d}",
                 "market_ticker": market_ticker,
                 "side": side,
                 "quantity": quantity,
@@ -193,32 +362,78 @@ class KalshiTradingClient:
                 "timestamp": datetime.now().isoformat(),
             }
 
-        # Live trading would go here
-        if not self.api_key:
+        # Check all safety gates
+        allowed, reason = self._check_safety_gates()
+        if not allowed:
+            print(f"[TradingClient] SAFETY GATE BLOCKED: {reason}")
             return {
                 "success": False,
-                "error": "API key required for live trading",
+                "error": f"Live trading blocked: {reason}",
                 "dry_run": False,
+                "safety_blocked": True,
             }
 
-        # TODO: Implement real Kalshi order submission
-        # This would require:
-        # 1. Authentication with Kalshi API
-        # 2. POST to /trade-api/v2/portfolio/orders
-        # 3. Handle order lifecycle (pending, filled, cancelled)
-        return {
-            "success": False,
-            "error": "Live trading not yet implemented",
-            "dry_run": False,
+        # LIVE TRADING - All gates passed
+        print(f"[TradingClient] LIVE ORDER: {side} {quantity}x {market_ticker} @ {price}c")
+
+        endpoint = "/portfolio/orders"
+        body = {
+            "ticker": market_ticker,
+            "side": side,
+            "action": "buy",
+            "count": quantity,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel",  # Safest option
         }
 
-    async def get_position(self, market_ticker: str) -> Optional[Dict[str, Any]]:
-        """Get current position for a market"""
-        if self.dry_run:
-            return None  # Positions tracked internally in dry-run mode
+        # Set price based on side
+        if side == "yes":
+            body["yes_price"] = int(price)
+        else:
+            body["no_price"] = int(price)
 
-        # TODO: Implement real position fetching
-        return None
+        try:
+            body_json = json.dumps(body)
+            headers = self._authenticator.sign_request("POST", endpoint, body_json)
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers,
+                    content=body_json
+                )
+
+                if response.status_code == 201:
+                    order_data = response.json().get("order", {})
+                    return {
+                        "success": True,
+                        "order_id": order_data.get("order_id"),
+                        "market_ticker": market_ticker,
+                        "side": side,
+                        "quantity": quantity,
+                        "price": price,
+                        "filled_quantity": order_data.get("fill_count", 0),
+                        "status": order_data.get("status", "unknown"),
+                        "dry_run": False,
+                        "timestamp": datetime.now().isoformat(),
+                        "taker_fees": order_data.get("taker_fees", 0),
+                    }
+                else:
+                    error_msg = response.text
+                    print(f"[TradingClient] Order failed: {response.status_code} - {error_msg}")
+                    return {
+                        "success": False,
+                        "error": f"API error {response.status_code}: {error_msg}",
+                        "dry_run": False,
+                    }
+
+        except Exception as e:
+            print(f"[TradingClient] Order exception: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "dry_run": False,
+            }
 
     async def close_position(
         self,
@@ -227,10 +442,77 @@ class KalshiTradingClient:
         quantity: int,
         price: float,
     ) -> Dict[str, Any]:
-        """Close an existing position"""
-        # Closing is just placing an opposite order
-        close_side = "no" if side == "yes" else "yes"
-        return await self.place_order(market_ticker, close_side, quantity, price)
+        """Close an existing position by selling."""
+        # To close: if we bought YES, we sell YES (action=sell)
+        # This is different from placing an opposite order
+
+        if self.dry_run:
+            self._order_counter += 1
+            return {
+                "success": True,
+                "order_id": f"DRY-CLOSE-{self._order_counter:06d}",
+                "market_ticker": market_ticker,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "status": "filled",
+                "dry_run": True,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        # Live close - same safety gates apply
+        allowed, reason = self._check_safety_gates()
+        if not allowed:
+            return {
+                "success": False,
+                "error": f"Live trading blocked: {reason}",
+                "safety_blocked": True,
+            }
+
+        endpoint = "/portfolio/orders"
+        body = {
+            "ticker": market_ticker,
+            "side": side,
+            "action": "sell",  # Selling to close
+            "count": quantity,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel",
+        }
+
+        if side == "yes":
+            body["yes_price"] = int(price)
+        else:
+            body["no_price"] = int(price)
+
+        try:
+            body_json = json.dumps(body)
+            headers = self._authenticator.sign_request("POST", endpoint, body_json)
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers,
+                    content=body_json
+                )
+
+                if response.status_code == 201:
+                    order_data = response.json().get("order", {})
+                    return {
+                        "success": True,
+                        "order_id": order_data.get("order_id"),
+                        "status": order_data.get("status"),
+                        "filled_quantity": order_data.get("fill_count", 0),
+                        "dry_run": False,
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"API error {response.status_code}",
+                        "dry_run": False,
+                    }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
 
 class TraderAgent(BaseAgent):

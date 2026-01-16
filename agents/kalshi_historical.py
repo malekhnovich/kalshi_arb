@@ -110,6 +110,10 @@ class KalshiHistoricalClient:
         self.base_url = base_url
         self.timeout = 30.0
         self.auth = KalshiAuthenticator(api_key, private_key_path)
+        # Use a semaphore to respect total concurrency limits if needed
+        # But we mostly care about the rate (req/s)
+        self._rate_limiter = asyncio.Semaphore(config.KALSHI_READ_LIMIT_PER_SECOND)
+        self._last_request_times: List[float] = []
 
     async def _request(
         self,
@@ -117,20 +121,22 @@ class KalshiHistoricalClient:
         endpoint: str,
         params: Optional[Dict] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Make authenticated request to Kalshi API."""
+        """Make authenticated request to Kalshi API with basic rate limiting."""
         url = f"{self.base_url}{endpoint}"
-
-        # Build path with params for the actual request
-        if params:
-            param_str = "&".join(f"{k}={v}" for k, v in params.items())
-            full_path = f"{endpoint}?{param_str}"
-        else:
-            full_path = endpoint
-
         headers = self.auth.get_auth_headers(method, endpoint)
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
+                # Simple sliding window rate limit (very basic)
+                now = time.time()
+                self._last_request_times = [t for t in self._last_request_times if now - t < 1.0]
+                if len(self._last_request_times) >= config.KALSHI_READ_LIMIT_PER_SECOND:
+                    wait_time = 1.1 - (now - self._last_request_times[0])
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
+                
+                self._last_request_times.append(time.time())
+
                 if method.upper() == "GET":
                     resp = await client.get(url, params=params, headers=headers)
                 else:
@@ -138,6 +144,10 @@ class KalshiHistoricalClient:
 
                 if resp.status_code == 200:
                     return resp.json()
+                elif resp.status_code == 429:
+                    logger.warning("Rate limit hit! Backing off...")
+                    await asyncio.sleep(1.0)
+                    return await self._request(method, endpoint, params)
                 else:
                     logger.warning(f"{endpoint} returned {resp.status_code}: {resp.text[:200]}")
                     return None
@@ -226,9 +236,7 @@ class KalshiHistoricalClient:
             if not cursor or len(trades) < limit:
                 break
 
-            # Rate limiting
-            await asyncio.sleep(0.2)
-
+            # Rate limiting is now handled in _request
         return all_trades
 
     async def get_events(
@@ -300,8 +308,7 @@ class KalshiHistoricalClient:
             if not cursor or len(markets) < limit:
                 break
 
-            await asyncio.sleep(0.2)
-
+            # Rate limiting is now handled in _request
         return all_markets
 
     async def get_market(self, ticker: str) -> Optional[Dict[str, Any]]:

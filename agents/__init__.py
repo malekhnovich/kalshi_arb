@@ -10,6 +10,15 @@ from .signal_aggregator import SignalAggregatorAgent
 from .backtester import BacktestAgent
 from .trader import TraderAgent
 
+# Optional WebSocket agent (requires websockets library)
+try:
+    from .kalshi_websocket import KalshiWebSocketClient, KalshiWebSocketAgent
+    _WS_AVAILABLE = True
+except ImportError:
+    KalshiWebSocketClient = None
+    KalshiWebSocketAgent = None
+    _WS_AVAILABLE = False
+
 __all__ = [
     "BaseAgent",
     "CircuitBreaker",
@@ -20,4 +29,6 @@ __all__ = [
     "SignalAggregatorAgent",
     "BacktestAgent",
     "TraderAgent",
+    "KalshiWebSocketClient",
+    "KalshiWebSocketAgent",
 ]

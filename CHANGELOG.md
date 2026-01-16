@@ -2,6 +2,84 @@
 
 All notable changes to the arbitrage detection system.
 
+## [1.3.0] - 2026-01-15
+
+### WebSocket Real-Time Data & Production Safety Gates
+
+Major upgrade adding real-time WebSocket streaming and comprehensive safety controls for live trading.
+
+#### New Features
+
+**1. WebSocket Integration**
+- **File**: `agents/kalshi_websocket.py` (NEW)
+- Real-time price streaming via `wss://api.elections.kalshi.com`
+- Sub-second price updates (vs 10-second polling)
+- Automatic reconnection with exponential backoff
+- Channels: `ticker`, `orderbook_delta`, `trade`
+- Fallback to polling if WebSocket unavailable
+
+**2. Live Trading Safety Gates**
+- **File**: `config.py:79-144`
+- Multiple safety checks required before live trading:
+  1. `KALSHI_ENABLE_LIVE_TRADING=true` environment variable
+  2. `./ENABLE_LIVE_TRADING` file must exist
+  3. `--live` CLI flag passed
+  4. Interactive "CONFIRM" prompt
+  5. No `./STOP_TRADING` kill switch file
+  6. Not running in CI environment
+- Run `python run_trader.py --check-safety` to see status
+
+**3. Full Order Placement API**
+- **File**: `agents/trader.py:161-515`
+- Complete Kalshi order API implementation
+- RSA-PSS authentication for trading
+- Balance checking (read-only, always safe)
+- Position fetching (read-only, always safe)
+- Order placement blocked unless ALL safety gates pass
+- `immediate_or_cancel` orders for safety
+
+**4. Enhanced Monitor with WS Support**
+- **File**: `agents/kalshi_monitor.py`
+- Hybrid WebSocket/polling mode
+- Auto-fallback to polling on WS disconnect
+- `get_mode()` returns "websocket" or "polling"
+
+#### Configuration
+
+```bash
+# WebSocket (auto-enabled if websockets library installed)
+export KALSHI_WS_ENABLED=true
+
+# Safety gates for live trading
+export KALSHI_ENABLE_LIVE_TRADING=true
+touch ./ENABLE_LIVE_TRADING
+
+# Kill switch to stop all trading
+touch ./STOP_TRADING
+```
+
+#### Usage
+
+```bash
+# Check safety gate status
+python run_trader.py --check-safety
+
+# Run in dry-run mode (default, safe)
+python run_trader.py
+
+# Attempt live trading (requires all gates + confirmation)
+python run_trader.py --live --max-position 25
+```
+
+#### Dependencies
+
+```bash
+pip install websockets  # Optional, for WebSocket support
+pip install cryptography  # Required for trading API auth
+```
+
+---
+
 ## [1.2.0] - 2026-01-14
 
 ### Real Kalshi Data Backtesting
