@@ -10,13 +10,17 @@ from .signal_aggregator import SignalAggregatorAgent
 from .backtester import BacktestAgent
 from .trader import TraderAgent
 
-# Optional WebSocket agent (requires websockets library)
+# Optional WebSocket agents (require websockets library)
 try:
     from .kalshi_websocket import KalshiWebSocketClient, KalshiWebSocketAgent
+    from .binance_websocket import BinanceWebSocketClient, BinanceWebSocketAgent
+
     _WS_AVAILABLE = True
 except ImportError:
     KalshiWebSocketClient = None
     KalshiWebSocketAgent = None
+    BinanceWebSocketClient = None
+    BinanceWebSocketAgent = None
     _WS_AVAILABLE = False
 
 __all__ = [
@@ -31,4 +35,6 @@ __all__ = [
     "TraderAgent",
     "KalshiWebSocketClient",
     "KalshiWebSocketAgent",
+    "BinanceWebSocketClient",
+    "BinanceWebSocketAgent",
 ]

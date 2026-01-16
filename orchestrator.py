@@ -15,6 +15,7 @@ from agents import (
     KalshiMonitorAgent,
     ArbitrageDetectorAgent,
     SignalAggregatorAgent,
+    BinanceWebSocketAgent,
 )
 import config
 
@@ -38,12 +39,20 @@ class Orchestrator:
 
     def _create_agents(self) -> None:
         """Instantiate all agents"""
-        self.agents = [
-            PriceMonitorAgent(self.event_bus),
-            KalshiMonitorAgent(self.event_bus),
-            ArbitrageDetectorAgent(self.event_bus),
-            SignalAggregatorAgent(self.event_bus),
-        ]
+        self.agents = []
+
+        # Binance Monitoring
+        if config.BINANCE_WS_ENABLED and BinanceWebSocketAgent:
+            self.agents.append(BinanceWebSocketAgent(self.event_bus))
+        else:
+            self.agents.append(PriceMonitorAgent(self.event_bus))
+
+        # Kalshi Monitoring (KalshiMonitorAgent handles its own WS fallback)
+        self.agents.append(KalshiMonitorAgent(self.event_bus))
+
+        # Core Strategy Agents
+        self.agents.append(ArbitrageDetectorAgent(self.event_bus))
+        self.agents.append(SignalAggregatorAgent(self.event_bus))
 
     async def start(self) -> None:
         """Start the orchestrator and all agents"""
@@ -107,8 +116,7 @@ class Orchestrator:
                 await asyncio.sleep(config.AGENT_HEALTH_CHECK_INTERVAL)
 
                 unhealthy = [
-                    agent.name for agent in self.agents
-                    if not agent.is_running
+                    agent.name for agent in self.agents if not agent.is_running
                 ]
 
                 if unhealthy:

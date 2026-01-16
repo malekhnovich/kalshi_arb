@@ -31,6 +31,7 @@ from agents import (
     ArbitrageDetectorAgent,
     SignalAggregatorAgent,
     TraderAgent,
+    BinanceWebSocketAgent,
 )
 import config
 
@@ -46,13 +47,19 @@ def check_live_trading_safety() -> tuple[bool, List[str]]:
     status = config.get_live_trading_status()
 
     if not status["env_var_set"]:
-        issues.append("KALSHI_ENABLE_LIVE_TRADING environment variable not set to 'true'")
+        issues.append(
+            "KALSHI_ENABLE_LIVE_TRADING environment variable not set to 'true'"
+        )
 
     if not status["enable_file_exists"]:
-        issues.append("./ENABLE_LIVE_TRADING file does not exist (create with: touch ./ENABLE_LIVE_TRADING)")
+        issues.append(
+            "./ENABLE_LIVE_TRADING file does not exist (create with: touch ./ENABLE_LIVE_TRADING)"
+        )
 
     if not status["not_in_ci"]:
-        issues.append("Running in CI/automated environment (CI or GITHUB_ACTIONS env var detected)")
+        issues.append(
+            "Running in CI/automated environment (CI or GITHUB_ACTIONS env var detected)"
+        )
 
     if not status["no_kill_switch"]:
         issues.append("Kill switch active (./STOP_TRADING file exists)")
@@ -81,10 +88,16 @@ def confirm_live_trading() -> bool:
     print()
     print("  Safety status:")
     status = config.get_live_trading_status()
-    print(f"    ✓ Environment variable: {'SET' if status['env_var_set'] else 'NOT SET'}")
-    print(f"    ✓ Enable file exists:   {'YES' if status['enable_file_exists'] else 'NO'}")
+    print(
+        f"    ✓ Environment variable: {'SET' if status['env_var_set'] else 'NOT SET'}"
+    )
+    print(
+        f"    ✓ Enable file exists:   {'YES' if status['enable_file_exists'] else 'NO'}"
+    )
     print(f"    ✓ Not in CI:            {'YES' if status['not_in_ci'] else 'NO'}")
-    print(f"    ✓ No kill switch:       {'YES' if status['no_kill_switch'] else 'ACTIVE'}")
+    print(
+        f"    ✓ No kill switch:       {'YES' if status['no_kill_switch'] else 'ACTIVE'}"
+    )
     print()
     print("=" * 60)
     print()
@@ -123,11 +136,23 @@ class TradingOrchestrator:
 
     def _create_agents(self) -> None:
         """Instantiate all agents including trader"""
-        self.agents = [
-            PriceMonitorAgent(self.event_bus),
-            KalshiMonitorAgent(self.event_bus),
-            ArbitrageDetectorAgent(self.event_bus),
-            SignalAggregatorAgent(self.event_bus),
+        self.agents = []
+
+        # Binance Monitoring
+        if config.BINANCE_WS_ENABLED and BinanceWebSocketAgent:
+            self.agents.append(BinanceWebSocketAgent(self.event_bus))
+        else:
+            self.agents.append(PriceMonitorAgent(self.event_bus))
+
+        # Kalshi Monitoring
+        self.agents.append(KalshiMonitorAgent(self.event_bus))
+
+        # Core Strategy Agents
+        self.agents.append(ArbitrageDetectorAgent(self.event_bus))
+        self.agents.append(SignalAggregatorAgent(self.event_bus))
+
+        # Trading Execution
+        self.agents.append(
             TraderAgent(
                 self.event_bus,
                 dry_run=self.dry_run,
@@ -135,8 +160,8 @@ class TradingOrchestrator:
                 max_open_positions=self.max_open_positions,
                 min_confidence=self.min_confidence,
                 min_edge=self.min_edge,
-            ),
-        ]
+            )
+        )
 
     async def start(self) -> None:
         """Start the orchestrator and all agents"""
@@ -150,6 +175,13 @@ class TradingOrchestrator:
         print(f"  Max Open Positions:  {self.max_open_positions}")
         print(f"  Min Confidence:      {self.min_confidence}%")
         print(f"  Min Edge:            {self.min_edge}c")
+        if self.dry_run:
+            realistic = (
+                "ON (fees, slippage, partial fills)"
+                if config.SIM_REALISTIC_MODE
+                else "OFF (ideal fills)"
+            )
+            print(f"  Realistic Sim:       {realistic}")
         print("=" * 60 + "\n")
 
         if not self.dry_run:
@@ -212,8 +244,7 @@ class TradingOrchestrator:
                 await asyncio.sleep(config.AGENT_HEALTH_CHECK_INTERVAL)
 
                 unhealthy = [
-                    agent.name for agent in self.agents
-                    if not agent.is_running
+                    agent.name for agent in self.agents if not agent.is_running
                 ]
 
                 if unhealthy:
@@ -237,48 +268,55 @@ def main():
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Enable live trading (requires safety gates - see docs)"
+        help="Enable live trading (requires safety gates - see docs)",
     )
     parser.add_argument(
         "--max-position",
         type=float,
         default=config.MAX_POSITION_SIZE,
-        help=f"Maximum position size in dollars (default: {config.MAX_POSITION_SIZE})"
+        help=f"Maximum position size in dollars (default: {config.MAX_POSITION_SIZE})",
     )
     parser.add_argument(
         "--max-positions",
         type=int,
         default=config.MAX_OPEN_POSITIONS,
-        help=f"Maximum number of open positions (default: {config.MAX_OPEN_POSITIONS})"
+        help=f"Maximum number of open positions (default: {config.MAX_OPEN_POSITIONS})",
     )
     parser.add_argument(
         "--min-confidence",
         type=float,
         default=70.0,
-        help="Minimum confidence threshold (default: 70)"
+        help="Minimum confidence threshold (default: 70)",
     )
     parser.add_argument(
         "--min-edge",
         type=float,
         default=10.0,
-        help="Minimum edge in cents (default: 10)"
+        help="Minimum edge in cents (default: 10)",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging"
-    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--check-safety",
         action="store_true",
-        help="Check safety gates and exit (useful for debugging)"
+        help="Check safety gates and exit (useful for debugging)",
+    )
+    parser.add_argument(
+        "--no-realistic",
+        action="store_true",
+        help="Disable realistic simulation in dry-run (no fees, slippage, partial fills)",
     )
 
     args = parser.parse_args()
 
     if args.debug:
         import logging
+
         logging.basicConfig(level=logging.DEBUG)
+
+    # Handle realistic simulation toggle
+    if args.no_realistic:
+        config.SIM_REALISTIC_MODE = False
+        print("[Config] Realistic simulation DISABLED - using ideal fills")
 
     # Check safety gates status
     if args.check_safety:

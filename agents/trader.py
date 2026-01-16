@@ -39,6 +39,8 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
 
+import random
+
 
 @dataclass
 class Position:
@@ -116,6 +118,11 @@ class TradingStats:
     signals_skipped: int = 0
     total_cost: float = 0.0
     total_contracts: int = 0
+    # Realistic simulation tracking
+    total_fees: float = 0.0  # Total fees paid (dollars)
+    total_slippage: float = 0.0  # Total slippage cost (dollars)
+    partial_fills: int = 0  # Count of partial fills
+    unfilled_contracts: int = 0  # Contracts that didn't fill
 
     @property
     def win_rate(self) -> float:
@@ -129,7 +136,6 @@ class TradingStats:
         """Average winning trade P&L"""
         if self.winning_trades == 0:
             return 0.0
-        # This would need trade-level tracking for accuracy
         return self.realized_pnl / self.winning_trades if self.realized_pnl > 0 else 0.0
 
     @property
@@ -138,6 +144,11 @@ class TradingStats:
         if self.losing_trades == 0:
             return 0.0
         return abs(self.realized_pnl) / self.losing_trades if self.realized_pnl < 0 else 0.0
+
+    @property
+    def total_friction(self) -> float:
+        """Total trading friction (fees + slippage)"""
+        return self.total_fees + self.total_slippage
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -155,6 +166,12 @@ class TradingStats:
             "signals_skipped": self.signals_skipped,
             "total_cost": round(self.total_cost, 2),
             "total_contracts": self.total_contracts,
+            # Realistic simulation stats
+            "total_fees": round(self.total_fees, 2),
+            "total_slippage": round(self.total_slippage, 2),
+            "total_friction": round(self.total_friction, 2),
+            "partial_fills": self.partial_fills,
+            "unfilled_contracts": self.unfilled_contracts,
         }
 
 
@@ -331,6 +348,82 @@ class KalshiTradingClient:
         except Exception as e:
             return {"success": False, "error": str(e), "positions": []}
 
+    def _simulate_realistic_fill(
+        self,
+        market_ticker: str,
+        side: str,
+        quantity: int,
+        price: float,
+    ) -> Dict[str, Any]:
+        """
+        Simulate a realistic order fill with fees, slippage, partial fills, and latency.
+
+        This provides a much more accurate estimate of real trading performance.
+        """
+        self._order_counter += 1
+        order_id = f"DRY-{self._order_counter:06d}"
+
+        # Start with requested values
+        fill_price = price
+        filled_quantity = quantity
+        fees = 0.0
+        slippage = 0.0
+
+        if config.SIM_REALISTIC_MODE:
+            # 1. SLIPPAGE: Price moves against you
+            base_slip = config.SIM_SLIPPAGE_BASE_CENTS
+            size_slip = config.SIM_SLIPPAGE_PER_CONTRACT * quantity
+            volatility = config.SIM_SLIPPAGE_VOLATILITY
+
+            # Random component (always adverse - buying pushes price up)
+            random_slip = random.uniform(0, base_slip + size_slip) * volatility
+            slippage = base_slip + random_slip
+
+            # Apply slippage (worse price for buyer)
+            fill_price = price + slippage
+
+            # 2. LATENCY PRICE MOVEMENT: Price may move during execution delay
+            if random.random() < config.SIM_PRICE_MOVE_PROBABILITY:
+                adverse_move = random.uniform(0, config.SIM_PRICE_MOVE_MAX_CENTS)
+                fill_price += adverse_move
+                slippage += adverse_move
+
+            # Cap fill price at 99 (can't pay more than max)
+            fill_price = min(fill_price, 99.0)
+
+            # 3. PARTIAL FILLS: May not get full quantity
+            if random.random() > config.SIM_FILL_RATE_BASE:
+                # Partial fill
+                fill_rate = random.uniform(config.SIM_MIN_FILL_RATE, 0.95)
+                filled_quantity = max(1, int(quantity * fill_rate))
+
+            # 4. FEES: Kalshi taker fee per contract
+            fees = config.SIM_TAKER_FEE_CENTS * filled_quantity
+
+        # Calculate actual cost
+        cost_cents = fill_price * filled_quantity + fees
+        cost_dollars = cost_cents / 100
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "market_ticker": market_ticker,
+            "side": side,
+            "quantity": quantity,
+            "requested_price": price,
+            "fill_price": round(fill_price, 2),
+            "filled_quantity": filled_quantity,
+            "unfilled_quantity": quantity - filled_quantity,
+            "slippage_cents": round(slippage, 2),
+            "fees_cents": round(fees, 2),
+            "total_cost_cents": round(cost_cents, 2),
+            "total_cost_dollars": round(cost_dollars, 4),
+            "status": "filled" if filled_quantity == quantity else "partial",
+            "dry_run": True,
+            "realistic_mode": config.SIM_REALISTIC_MODE,
+            "timestamp": datetime.now().isoformat(),
+        }
+
     async def place_order(
         self,
         market_ticker: str,
@@ -341,26 +434,14 @@ class KalshiTradingClient:
         """
         Place an order on Kalshi.
 
-        SAFETY: In dry-run mode (default), simulates order fill.
+        SAFETY: In dry-run mode (default), simulates order fill with realistic
+        slippage, fees, partial fills, and latency.
         Live trading requires ALL safety gates to pass.
         """
-        self._order_counter += 1
-
         # Always check safety gates first
         if self.dry_run:
-            # Simulate immediate fill
-            return {
-                "success": True,
-                "order_id": f"DRY-{self._order_counter:06d}",
-                "market_ticker": market_ticker,
-                "side": side,
-                "quantity": quantity,
-                "price": price,
-                "filled_quantity": quantity,
-                "status": "filled",
-                "dry_run": True,
-                "timestamp": datetime.now().isoformat(),
-            }
+            # Simulate with realistic market conditions
+            return self._simulate_realistic_fill(market_ticker, side, quantity, price)
 
         # Check all safety gates
         allowed, reason = self._check_safety_gates()
@@ -648,58 +729,91 @@ class TraderAgent(BaseAgent):
             print(f"[{self.name}] Order failed: {result.get('error')}")
             return
 
-        # Create position record
+        # Handle realistic simulation results
+        actual_fill_price = result.get("fill_price", price)
+        actual_filled_qty = result.get("filled_quantity", quantity)
+        fees_cents = result.get("fees_cents", 0)
+        slippage_cents = result.get("slippage_cents", 0)
+        total_cost_cents = result.get("total_cost_cents", actual_fill_price * actual_filled_qty)
+        is_partial = result.get("status") == "partial"
+
+        # Skip if we got zero fills
+        if actual_filled_qty == 0:
+            print(f"[{self.name}] Order not filled - no liquidity")
+            return
+
+        # Actual cost in dollars
+        actual_cost = total_cost_cents / 100
+
+        # Create position record with ACTUAL fill values
         position = Position(
             id=result["order_id"],
             timestamp=datetime.now(),
             market_ticker=signal.market_ticker,
             symbol=signal.symbol,
             side=side,
-            quantity=quantity,
-            entry_price=price,
-            current_price=price,
+            quantity=actual_filled_qty,  # Use actual filled quantity
+            entry_price=actual_fill_price,  # Use actual fill price
+            current_price=actual_fill_price,
         )
 
         self.positions[signal.market_ticker] = position
         self.stats.signals_executed += 1
-        self.stats.total_cost += cost
-        self.stats.total_contracts += quantity
+        self.stats.total_cost += actual_cost
+        self.stats.total_contracts += actual_filled_qty
+
+        # Track realistic simulation stats
+        self.stats.total_fees += fees_cents / 100
+        self.stats.total_slippage += (slippage_cents * actual_filled_qty) / 100
+        if is_partial:
+            self.stats.partial_fills += 1
+            self.stats.unfilled_contracts += (quantity - actual_filled_qty)
 
         # Update signal tracking
         signal_key = f"{signal.symbol}_{signal.market_ticker}"
         self._recent_signals[signal_key] = datetime.now()
 
         # Calculate theoretical win probability and expected value
-        # Based on momentum as a proxy for win probability
-        win_prob = signal.confidence / 100  # Use confidence as win probability
-        expected_payout = win_prob * 100 + (1 - win_prob) * 0  # Binary outcome
-        expected_pnl = (expected_payout - price) * quantity / 100
+        # Using ACTUAL fill price, not requested price
+        win_prob = signal.confidence / 100
+        expected_payout = win_prob * 100 + (1 - win_prob) * 0
+        # Account for fees in expected P&L
+        expected_pnl = (expected_payout - actual_fill_price) * actual_filled_qty / 100 - (fees_cents / 100)
 
-        # Kelly criterion for optimal position sizing (informational)
-        # f* = (bp - q) / b where b=odds, p=win prob, q=lose prob
-        b = (100 - price) / price  # Odds (potential win / risk)
+        # Kelly criterion with actual fill price
+        b = (100 - actual_fill_price) / actual_fill_price if actual_fill_price > 0 else 0
         kelly_fraction = (b * win_prob - (1 - win_prob)) / b if b > 0 else 0
-        kelly_fraction = max(0, min(kelly_fraction, 0.25))  # Cap at 25%
+        kelly_fraction = max(0, min(kelly_fraction, 0.25))
 
-        # Log the trade
+        # Log the trade with realistic details
         mode_tag = "[DRY-RUN]" if self.dry_run else "[LIVE]"
+        realistic_tag = " (Realistic)" if result.get("realistic_mode") else ""
+        partial_tag = " [PARTIAL FILL]" if is_partial else ""
+
         print(f"\n{'='*60}")
-        print(f"[{self.name}] {mode_tag} TRADE EXECUTED")
+        print(f"[{self.name}] {mode_tag}{realistic_tag} TRADE EXECUTED{partial_tag}")
         print(f"{'='*60}")
         print(f"  Order ID:     {position.id}")
         print(f"  Market:       {signal.market_ticker}")
         print(f"  Symbol:       {signal.symbol}")
         print(f"  Side:         {side.upper()}")
-        print(f"  Quantity:     {quantity} contracts")
-        print(f"  Price:        {price}c")
-        print(f"  Cost:         ${cost:.2f}")
         print(f"-" * 60)
+        print(f"  EXECUTION DETAILS")
+        print(f"  Requested:    {quantity} contracts @ {price}c")
+        print(f"  Filled:       {actual_filled_qty} contracts @ {actual_fill_price}c")
+        if slippage_cents > 0:
+            print(f"  Slippage:     +{slippage_cents}c (adverse)")
+        if fees_cents > 0:
+            print(f"  Fees:         {fees_cents}c (${fees_cents/100:.2f})")
+        print(f"  Total Cost:   ${actual_cost:.2f}")
+        print(f"-" * 60)
+        print(f"  SIGNAL ANALYSIS")
         print(f"  Confidence:   {signal.confidence}%")
-        print(f"  Expected Edge: {signal.spread}c")
+        print(f"  Expected Edge: {signal.spread}c → {signal.spread - slippage_cents:.1f}c (after slippage)")
         print(f"  Win Prob:     {win_prob*100:.1f}%")
-        print(f"  Expected P&L: ${expected_pnl:.2f}")
-        print(f"  Max Win:      ${(100-price)*quantity/100:.2f}")
-        print(f"  Max Loss:     -${cost:.2f}")
+        print(f"  Expected P&L: ${expected_pnl:.2f} (after fees)")
+        print(f"  Max Win:      ${(100-actual_fill_price)*actual_filled_qty/100:.2f}")
+        print(f"  Max Loss:     -${actual_cost:.2f}")
         print(f"  Kelly %:      {kelly_fraction*100:.1f}%")
         print(f"{'='*60}\n")
 
@@ -840,6 +954,21 @@ class TraderAgent(BaseAgent):
         print(f"  Unrealized P&L:    ${total_unrealized:.2f}")
         print(f"  Total P&L:         ${stats.realized_pnl + total_unrealized:.2f}")
         print(f"  Max Drawdown:      ${stats.max_drawdown:.2f}")
+
+        # Show realistic simulation costs
+        if config.SIM_REALISTIC_MODE and self.dry_run:
+            print(f"-" * 60)
+            print(f"  TRADING FRICTION (Realistic Simulation)")
+            print(f"  Total Fees:        ${stats.total_fees:.2f}")
+            print(f"  Total Slippage:    ${stats.total_slippage:.2f}")
+            print(f"  Total Friction:    ${stats.total_friction:.2f}")
+            if stats.partial_fills > 0:
+                print(f"  Partial Fills:     {stats.partial_fills}")
+                print(f"  Unfilled Contracts: {stats.unfilled_contracts}")
+            print(f"-" * 60)
+            net_pnl = stats.realized_pnl + total_unrealized - stats.total_friction
+            print(f"  NET P&L (after friction): ${net_pnl:.2f}")
+
         print(f"{'='*60}")
 
         # Print open positions detail

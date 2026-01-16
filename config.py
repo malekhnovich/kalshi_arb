@@ -51,10 +51,14 @@ BINANCE_US_API_URL = _get_env_str("BINANCE_API_URL", "https://api.binance.us/api
 BINANCE_SYMBOLS = _get_env_list("BINANCE_SYMBOLS", ["SOLUSDT", "BTCUSDT", "ETHUSDT"])
 # Env: POLL_INTERVAL_BINANCE
 POLL_INTERVAL_BINANCE = _get_env_int("POLL_INTERVAL_BINANCE", 5)  # seconds
+# Env: BINANCE_WS_ENABLED
+BINANCE_WS_ENABLED = _get_env_str("BINANCE_WS_ENABLED", "true").lower() == "true"
 
 # Kalshi Configuration
 # Env: KALSHI_API_URL
-KALSHI_API_URL = _get_env_str("KALSHI_API_URL", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_API_URL = _get_env_str(
+    "KALSHI_API_URL", "https://api.elections.kalshi.com/trade-api/v2"
+)
 # Env: POLL_INTERVAL_KALSHI
 POLL_INTERVAL_KALSHI = _get_env_int("POLL_INTERVAL_KALSHI", 10)  # seconds
 # Env: KALSHI_CRYPTO_SERIES (comma-separated)
@@ -68,11 +72,15 @@ KALSHI_PRIVATE_KEY_PATH = _get_env_str("KALSHI_PRIVATE_KEY_PATH", "")
 
 # Kalshi WebSocket Configuration
 # Env: KALSHI_WS_URL
-KALSHI_WS_URL = _get_env_str("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+KALSHI_WS_URL = _get_env_str(
+    "KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2"
+)
 # Env: KALSHI_WS_RECONNECT_DELAY
 KALSHI_WS_RECONNECT_DELAY = _get_env_int("KALSHI_WS_RECONNECT_DELAY", 5)  # seconds
 # Env: KALSHI_WS_HEARTBEAT_INTERVAL
-KALSHI_WS_HEARTBEAT_INTERVAL = _get_env_int("KALSHI_WS_HEARTBEAT_INTERVAL", 10)  # seconds
+KALSHI_WS_HEARTBEAT_INTERVAL = _get_env_int(
+    "KALSHI_WS_HEARTBEAT_INTERVAL", 10
+)  # seconds
 # Env: KALSHI_WS_ENABLED
 KALSHI_WS_ENABLED = _get_env_str("KALSHI_WS_ENABLED", "true").lower() == "true"
 
@@ -155,17 +163,19 @@ CONFIDENCE_THRESHOLD = _get_env_int("CONFIDENCE_THRESHOLD", 70)  # percent confi
 MIN_ODDS_SPREAD = _get_env_float("MIN_ODDS_SPREAD", 10.0)  # Minimum spread (cents)
 # Env: ODDS_NEUTRAL_RANGE (comma-separated, e.g., "45,55")
 ODDS_NEUTRAL_RANGE = _get_env_tuple("ODDS_NEUTRAL_RANGE", (45, 55))
+# Env: STRIKE_DISTANCE_THRESHOLD_PCT (within X% of strike price)
+STRIKE_DISTANCE_THRESHOLD_PCT = _get_env_float("STRIKE_DISTANCE_THRESHOLD_PCT", 0.5)
 
 # Logging Configuration
 # Env: LOG_DIR
 LOG_DIR = Path(_get_env_str("LOG_DIR", "logs"))
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 CONSOLE_COLORS = {
-    "INFO": "\033[94m",      # Blue
-    "WARNING": "\033[93m",   # Yellow
+    "INFO": "\033[94m",  # Blue
+    "WARNING": "\033[93m",  # Yellow
     "OPPORTUNITY": "\033[92m",  # Green
-    "ERROR": "\033[91m",     # Red
-    "RESET": "\033[0m"
+    "ERROR": "\033[91m",  # Red
+    "RESET": "\033[0m",
 }
 
 # Agent Configuration
@@ -182,7 +192,9 @@ HTTP_MAX_RETRIES = _get_env_int("HTTP_MAX_RETRIES", 3)
 # Env: CIRCUIT_BREAKER_THRESHOLD
 CIRCUIT_BREAKER_THRESHOLD = _get_env_int("CIRCUIT_BREAKER_THRESHOLD", 5)
 # Env: CIRCUIT_BREAKER_RECOVERY_TIMEOUT
-CIRCUIT_BREAKER_RECOVERY_TIMEOUT = _get_env_float("CIRCUIT_BREAKER_RECOVERY_TIMEOUT", 60.0)
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT = _get_env_float(
+    "CIRCUIT_BREAKER_RECOVERY_TIMEOUT", 60.0
+)
 
 # Symbol mapping between exchanges
 SYMBOL_MAP = {
@@ -210,3 +222,43 @@ BACKTEST_TRADING_FEE_RATE = _get_env_float("BACKTEST_TRADING_FEE_RATE", 0.03)
 BACKTEST_PARALLEL_BATCH_SIZE = _get_env_int("BACKTEST_PARALLEL_BATCH_SIZE", 25)
 # Env: KALSHI_READ_LIMIT_PER_SECOND
 KALSHI_READ_LIMIT_PER_SECOND = _get_env_int("KALSHI_READ_LIMIT_PER_SECOND", 30)
+
+# ============================================================================
+# REALISTIC SIMULATION SETTINGS (Dry-Run Mode)
+# ============================================================================
+# These settings make dry-run mode more realistic by simulating real-world
+# trading conditions like fees, slippage, partial fills, and latency.
+
+# Env: SIM_REALISTIC_MODE (enable all realistic simulations)
+SIM_REALISTIC_MODE = _get_env_str("SIM_REALISTIC_MODE", "true").lower() == "true"
+
+# Kalshi Fee Structure (per contract, in cents)
+# Kalshi charges taker fees for immediate fills
+# Env: SIM_TAKER_FEE_CENTS (typical: 2-7 cents per contract)
+SIM_TAKER_FEE_CENTS = _get_env_float("SIM_TAKER_FEE_CENTS", 3.0)
+
+# Slippage Simulation
+# Env: SIM_SLIPPAGE_BASE_CENTS (base slippage in cents)
+SIM_SLIPPAGE_BASE_CENTS = _get_env_float("SIM_SLIPPAGE_BASE_CENTS", 1.0)
+# Env: SIM_SLIPPAGE_PER_CONTRACT (additional slippage per contract)
+SIM_SLIPPAGE_PER_CONTRACT = _get_env_float("SIM_SLIPPAGE_PER_CONTRACT", 0.1)
+# Env: SIM_SLIPPAGE_VOLATILITY (random volatility factor 0-1)
+SIM_SLIPPAGE_VOLATILITY = _get_env_float("SIM_SLIPPAGE_VOLATILITY", 0.5)
+
+# Partial Fill Simulation
+# Env: SIM_FILL_RATE_BASE (base probability of full fill, 0-1)
+SIM_FILL_RATE_BASE = _get_env_float("SIM_FILL_RATE_BASE", 0.85)
+# Env: SIM_MIN_FILL_RATE (minimum fill rate when partial, 0-1)
+SIM_MIN_FILL_RATE = _get_env_float("SIM_MIN_FILL_RATE", 0.3)
+
+# Latency Simulation
+# Env: SIM_LATENCY_MS (average latency in milliseconds)
+SIM_LATENCY_MS = _get_env_int("SIM_LATENCY_MS", 250)
+# Env: SIM_LATENCY_JITTER_MS (random jitter +/- milliseconds)
+SIM_LATENCY_JITTER_MS = _get_env_int("SIM_LATENCY_JITTER_MS", 100)
+
+# Price Movement During Latency
+# Env: SIM_PRICE_MOVE_PROBABILITY (chance price moves against you during latency)
+SIM_PRICE_MOVE_PROBABILITY = _get_env_float("SIM_PRICE_MOVE_PROBABILITY", 0.3)
+# Env: SIM_PRICE_MOVE_MAX_CENTS (max adverse price move in cents)
+SIM_PRICE_MOVE_MAX_CENTS = _get_env_float("SIM_PRICE_MOVE_MAX_CENTS", 3.0)
