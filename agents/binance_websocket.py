@@ -76,7 +76,12 @@ class BinanceWebSocketClient:
         if self._connected:
             return True
 
-        combined_url = f"{self.ws_url}/{'/'.join(streams)}"
+        if len(streams) > 1:
+            combined_url = (
+                f"{self.ws_url.replace('/ws', '/stream')}?streams={'/'.join(streams)}"
+            )
+        else:
+            combined_url = f"{self.ws_url}/{streams[0]}"
 
         try:
             print(f"[BinanceWS] Connecting to {combined_url}...")
@@ -169,6 +174,8 @@ class BinanceWebSocketAgent(BaseAgent):
 
         # State for momentum calculation
         self._price_history: Dict[str, List[Dict]] = {s: [] for s in self.symbols}
+        self._running_up_moves: Dict[str, int] = {s: 0 for s in self.symbols}
+        self._running_total_moves: Dict[str, int] = {s: 0 for s in self.symbols}
 
         # Register handlers for each symbol
         for symbol in self.symbols:
@@ -198,24 +205,45 @@ class BinanceWebSocketAgent(BaseAgent):
         price = float(data.get("p", 0))
         timestamp = data.get("E", time.time() * 1000) / 1000
 
-        # Update price history for momentum
+        # Update price history and running counts for momentum
         history = self._price_history.get(symbol.lower(), [])
+
+        # Add new transition to running counts
+        if history:
+            prev_price = history[-1]["price"]
+            self._running_total_moves[symbol.lower()] += 1
+            if price > prev_price:
+                self._running_up_moves[symbol.lower()] += 1
+
         history.append({"price": price, "time": timestamp})
 
-        # Clean up old history (beyond momentum window)
+        # Clean up old history (beyond momentum window) and subtract from running counts
         cutoff = timestamp - (self._momentum_window * 60)
-        while history and history[0]["time"] < cutoff:
+        while len(history) >= 2 and history[0]["time"] < cutoff:
+            t0 = history[0]
+            t1 = history[1]
+
+            # Remove the transition between t0 and t1 from running counts
+            self._running_total_moves[symbol.lower()] -= 1
+            if t1["price"] > t0["price"]:
+                self._running_up_moves[symbol.lower()] -= 1
+
             history.pop(0)
+
+        # Calculate momentum using running counts (O(1))
+        up_moves = self._running_up_moves.get(symbol.lower(), 0)
+        total_moves = self._running_total_moves.get(symbol.lower(), 0)
+        momentum_up_pct = (up_moves / total_moves * 100) if total_moves > 0 else 50.0
 
         # Emit event
         event = PriceUpdateEvent(
             symbol=symbol,
             price=price,
-            volume_24h=0.0,  # Not available in aggTrade data easily
+            volume_24h=0.0,
             price_change_24h=0.0,
-            momentum_up_pct=50.0,  # Placeholder
+            momentum_up_pct=round(momentum_up_pct, 2),
             momentum_window_minutes=self._momentum_window,
-            candles_analyzed=0,
+            candles_analyzed=len(history),
             trend_confirmed=False,
         )
         await self.publish(event)

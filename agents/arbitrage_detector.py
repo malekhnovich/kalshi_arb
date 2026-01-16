@@ -161,6 +161,25 @@ class ArbitrageDetectorAgent(BaseAgent):
             distance_pct = abs(price_event.price - strike_price) / strike_price
             dist_check = distance_pct <= self.strike_distance_threshold
 
+        # Debug logging for skipped signals (only log if momentum is significant)
+        if (strong_up or strong_down) and not (
+            odds_neutral and is_accelerating and dist_check
+        ):
+            # Calculate what failure caused the skip
+            reasons = []
+            if not odds_neutral:
+                reasons.append(f"NotNeutral({yes_price}c)")
+            if not is_accelerating:
+                reasons.append("Decelerating")
+            if not dist_check:
+                reasons.append(
+                    f"TooFar({distance_pct * 100:.1f}% > {self.strike_distance_threshold * 100}%)"
+                )
+
+            print(
+                f"[{self.name}] Skipping {symbol}: Momentum={momentum:.1f}, Reasons={', '.join(reasons)}"
+            )
+
         # Arbitrage exists if spot is directional but odds are neutral
         if (
             (strong_up or strong_down)
