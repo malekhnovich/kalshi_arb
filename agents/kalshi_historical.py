@@ -21,8 +21,8 @@ import config
 # Configure logger with file, line, and time
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(filename)s:%(lineno)d | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s | %(filename)s:%(lineno)d | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
+
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
@@ -129,18 +130,22 @@ class KalshiHistoricalClient:
             try:
                 # Simple sliding window rate limit (very basic)
                 now = time.time()
-                self._last_request_times = [t for t in self._last_request_times if now - t < 1.0]
+                self._last_request_times = [
+                    t for t in self._last_request_times if now - t < 1.0
+                ]
                 if len(self._last_request_times) >= config.KALSHI_READ_LIMIT_PER_SECOND:
                     wait_time = 1.1 - (now - self._last_request_times[0])
                     if wait_time > 0:
                         await asyncio.sleep(wait_time)
-                
+
                 self._last_request_times.append(time.time())
 
                 if method.upper() == "GET":
                     resp = await client.get(url, params=params, headers=headers)
                 else:
-                    resp = await client.request(method, url, params=params, headers=headers)
+                    resp = await client.request(
+                        method, url, params=params, headers=headers
+                    )
 
                 if resp.status_code == 200:
                     return resp.json()
@@ -149,7 +154,9 @@ class KalshiHistoricalClient:
                     await asyncio.sleep(1.0)
                     return await self._request(method, endpoint, params)
                 else:
-                    logger.warning(f"{endpoint} returned {resp.status_code}: {resp.text[:200]}")
+                    logger.warning(
+                        f"{endpoint} returned {resp.status_code}: {resp.text[:200]}"
+                    )
                     return None
 
             except Exception as e:
@@ -356,7 +363,9 @@ async def test_client():
 
             if candles:
                 c = candles[0]
-                print(f"Sample candle: ts={c.get('end_period_ts')}, vol={c.get('volume')}")
+                print(
+                    f"Sample candle: ts={c.get('end_period_ts')}, vol={c.get('volume')}"
+                )
 
 
 if __name__ == "__main__":

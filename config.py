@@ -68,7 +68,7 @@ KALSHI_CRYPTO_SERIES = _get_env_list("KALSHI_CRYPTO_SERIES", ["KXBTC", "KXETH"])
 # Env: KALSHI_API_KEY
 KALSHI_API_KEY = _get_env_str("KALSHI_API_KEY", "")
 # Env: KALSHI_PRIVATE_KEY_PATH (path to private key file for RSA signing)
-KALSHI_PRIVATE_KEY_PATH = _get_env_str("KALSHI_PRIVATE_KEY_PATH", "")
+KALSHI_PRIVATE_KEY_PATH = _get_env_str("KALSHI_PRIVATE_KEY_PATH", "private_key.pem")
 
 # Kalshi WebSocket Configuration
 # Env: KALSHI_WS_URL

@@ -10,12 +10,18 @@ import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 try:
-    import websockets
+    from websockets.asyncio.client import connect as ws_connect
     from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
-    WEBSOCKETS_AVAILABLE = False
+    try:
+        from websockets import connect as ws_connect
+        from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+
+        WEBSOCKETS_AVAILABLE = True
+    except ImportError:
+        WEBSOCKETS_AVAILABLE = False
 
 from .base import BaseAgent
 from events import EventBus, PriceUpdateEvent
@@ -74,7 +80,7 @@ class BinanceWebSocketClient:
 
         try:
             print(f"[BinanceWS] Connecting to {combined_url}...")
-            self._ws = await websockets.connect(combined_url)
+            self._ws = await ws_connect(combined_url)
             self._connected = True
             self._running = True
             self._last_message_time = time.time()

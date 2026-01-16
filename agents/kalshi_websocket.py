@@ -12,11 +12,18 @@ from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 
 try:
-    import websockets
+    from websockets.asyncio.client import connect as ws_connect
     from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
-    WEBSOCKETS_AVAILABLE = False
+    try:
+        from websockets import connect as ws_connect
+        from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+
+        WEBSOCKETS_AVAILABLE = True
+    except ImportError:
+        WEBSOCKETS_AVAILABLE = False
 
 from .base import BaseAgent
 from events import EventBus, KalshiOddsEvent
@@ -107,16 +114,61 @@ class KalshiWebSocketClient:
                     "KALSHI-ACCESS-KEY": self.api_key,
                     "KALSHI-ACCESS-TIMESTAMP": timestamp,
                 }
-                # Note: Full auth requires signature - for now using key-only
-                # WebSocket auth may differ from REST auth
+                # Implement full RSA signing if private key available
+                if self.private_key_path:
+                    try:
+                        from cryptography.hazmat.primitives import serialization, hashes
+                        from cryptography.hazmat.primitives.asymmetric import padding
+                        import base64
+
+                        with open(self.private_key_path, "rb") as key_file:
+                            private_key = serialization.load_pem_private_key(
+                                key_file.read(), password=None
+                            )
+
+                        # Sign the timestamp+method+path string
+                        # For WebSocket connect, it's typically just timestamp or specific payload
+                        # Kalshi docs say: timestamp + "GET" + "/trade-api/ws/v2" if connecting there
+                        # But typically for WS it's just the timestamp or the key itself needed
+
+                        # Kalshi documentation requires timestamp + "GET" + "/trade-api/ws/v2"
+                        method = "GET"
+                        path = "/trade-api/ws/v2"
+                        msg = (timestamp + method + path).encode("utf-8")
+
+                        signature = private_key.sign(
+                            msg,
+                            padding.PSS(
+                                mgf=padding.MGF1(hashes.SHA256()),
+                                salt_length=padding.PSS.MAX_LENGTH,
+                            ),
+                            hashes.SHA256(),
+                        )
+                        headers["KALSHI-ACCESS-SIGNATURE"] = base64.b64encode(
+                            signature
+                        ).decode("utf-8")
+
+                    except Exception as e:
+                        print(f"[KalshiWS] Auth signature failed: {e}")
 
             print(f"[KalshiWS] Connecting to {url}...")
-            self._ws = await websockets.connect(
-                url,
-                extra_headers=headers if headers else None,
-                ping_interval=None,  # We handle heartbeat manually
-                ping_timeout=None,
-            )
+
+            # Use 'additional_headers' for websockets 14.0+, fallback to 'extra_headers'
+            ws_args = {
+                "ping_interval": None,
+                "ping_timeout": None,
+            }
+
+            if headers:
+                # Version check - websockets 14.0+ uses additional_headers
+                import websockets
+
+                if hasattr(websockets, "asyncio"):
+                    ws_args["additional_headers"] = headers
+                else:
+                    ws_args["extra_headers"] = headers
+
+            self._ws = await ws_connect(url, **ws_args)
 
             self._connected = True
             self._running = True
@@ -133,7 +185,8 @@ class KalshiWebSocketClient:
         except Exception as e:
             print(f"[KalshiWS] Connection failed: {e}")
             self._connected = False
-            return False
+            # CRITICAL: Fail fast if WebSocket connection fails
+            raise ConnectionError(f"Failed to connect to Kalshi WebSocket: {e}")
 
     async def disconnect(self) -> None:
         """Disconnect from WebSocket."""
@@ -193,12 +246,14 @@ class KalshiWebSocketClient:
             "params": {
                 "channels": [channel],
                 "market_tickers": market_tickers,
-            }
+            },
         }
 
         try:
             await self._ws.send(json.dumps(command))
-            print(f"[KalshiWS] Subscribing to {channel} for {len(market_tickers)} markets")
+            print(
+                f"[KalshiWS] Subscribing to {channel} for {len(market_tickers)} markets"
+            )
             return cmd_id
         except Exception as e:
             print(f"[KalshiWS] Subscribe failed: {e}")
@@ -215,9 +270,7 @@ class KalshiWebSocketClient:
         command = {
             "id": cmd_id,
             "cmd": "unsubscribe",
-            "params": {
-                "sids": [subscription_id]
-            }
+            "params": {"sids": [subscription_id]},
         }
 
         try:
@@ -230,7 +283,7 @@ class KalshiWebSocketClient:
         self,
         subscription_id: int,
         market_tickers: List[str],
-        action: str = "add_markets"
+        action: str = "add_markets",
     ) -> bool:
         """
         Update a subscription to add or remove markets.
@@ -253,7 +306,7 @@ class KalshiWebSocketClient:
                 "sids": [subscription_id],
                 "market_tickers": market_tickers,
                 "action": action,
-            }
+            },
         }
 
         try:
@@ -266,10 +319,7 @@ class KalshiWebSocketClient:
         """Main loop to receive and process WebSocket messages."""
         while self._running and self._ws:
             try:
-                message = await asyncio.wait_for(
-                    self._ws.recv(),
-                    timeout=30.0
-                )
+                message = await asyncio.wait_for(self._ws.recv(), timeout=30.0)
                 self._last_message_time = time.time()
                 await self._handle_message(message)
 
@@ -361,7 +411,9 @@ class KalshiWebSocketClient:
         self._reconnect_count += 1
 
         if self._reconnect_count > self._max_reconnect_attempts:
-            print(f"[KalshiWS] Max reconnect attempts reached ({self._max_reconnect_attempts})")
+            print(
+                f"[KalshiWS] Max reconnect attempts reached ({self._max_reconnect_attempts})"
+            )
             return
 
         # Exponential backoff: 5, 10, 20, 40... up to 60 seconds
