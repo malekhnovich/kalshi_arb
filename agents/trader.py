@@ -2,10 +2,18 @@
 Trader Agent - Executes trades on Kalshi based on arbitrage signals.
 
 Supports dry-run mode for paper trading without real execution.
+
+SAFETY: Live trading is DISABLED by default and requires multiple safety gates:
+1. KALSHI_ENABLE_LIVE_TRADING=true environment variable
+2. ./ENABLE_LIVE_TRADING file must exist
+3. --live flag passed to CLI
+4. Interactive confirmation prompt
 """
 
 import asyncio
+import base64
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,6 +30,16 @@ from events import (
     AlertEvent,
 )
 import config
+
+# Try to import cryptography for RSA-PSS signing
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
+import random
 
 
 @dataclass
@@ -100,6 +118,11 @@ class TradingStats:
     signals_skipped: int = 0
     total_cost: float = 0.0
     total_contracts: int = 0
+    # Realistic simulation tracking
+    total_fees: float = 0.0  # Total fees paid (dollars)
+    total_slippage: float = 0.0  # Total slippage cost (dollars)
+    partial_fills: int = 0  # Count of partial fills
+    unfilled_contracts: int = 0  # Contracts that didn't fill
 
     @property
     def win_rate(self) -> float:
@@ -113,7 +136,6 @@ class TradingStats:
         """Average winning trade P&L"""
         if self.winning_trades == 0:
             return 0.0
-        # This would need trade-level tracking for accuracy
         return self.realized_pnl / self.winning_trades if self.realized_pnl > 0 else 0.0
 
     @property
@@ -122,6 +144,11 @@ class TradingStats:
         if self.losing_trades == 0:
             return 0.0
         return abs(self.realized_pnl) / self.losing_trades if self.realized_pnl < 0 else 0.0
+
+    @property
+    def total_friction(self) -> float:
+        """Total trading friction (fees + slippage)"""
+        return self.total_fees + self.total_slippage
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -139,15 +166,77 @@ class TradingStats:
             "signals_skipped": self.signals_skipped,
             "total_cost": round(self.total_cost, 2),
             "total_contracts": self.total_contracts,
+            # Realistic simulation stats
+            "total_fees": round(self.total_fees, 2),
+            "total_slippage": round(self.total_slippage, 2),
+            "total_friction": round(self.total_friction, 2),
+            "partial_fills": self.partial_fills,
+            "unfilled_contracts": self.unfilled_contracts,
+        }
+
+
+class KalshiAuthenticator:
+    """RSA-PSS authenticator for Kalshi API requests."""
+
+    def __init__(self, api_key: str, private_key_path: str):
+        if not CRYPTO_AVAILABLE:
+            raise ImportError("cryptography library required for authentication")
+
+        self.api_key = api_key
+        self._private_key = None
+
+        # Load private key
+        if private_key_path and Path(private_key_path).exists():
+            with open(private_key_path, "rb") as f:
+                self._private_key = serialization.load_pem_private_key(
+                    f.read(), password=None
+                )
+
+    def sign_request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[str] = None
+    ) -> Dict[str, str]:
+        """Generate authentication headers for a request."""
+        if not self._private_key:
+            raise ValueError("Private key not loaded")
+
+        timestamp = str(int(time.time() * 1000))
+
+        # Message to sign: timestamp + method + path + body
+        message = timestamp + method.upper() + path
+        if body:
+            message += body
+
+        # Sign with RSA-PSS
+        signature = self._private_key.sign(
+            message.encode("utf-8"),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+            "Content-Type": "application/json",
         }
 
 
 class KalshiTradingClient:
     """
-    Kalshi trading client with dry-run support.
+    Kalshi trading client with dry-run support and safety gates.
 
-    In dry-run mode, simulates order execution without hitting the API.
-    In live mode, would execute real trades (requires authentication).
+    SAFETY: Live trading requires ALL of these to be true:
+    1. dry_run=False passed to constructor
+    2. config.is_live_trading_allowed() returns True
+    3. API credentials are valid
+
+    In dry-run mode (default), simulates order execution.
     """
 
     def __init__(
@@ -155,12 +244,185 @@ class KalshiTradingClient:
         base_url: str = config.KALSHI_API_URL,
         dry_run: bool = True,
         api_key: Optional[str] = None,
+        private_key_path: Optional[str] = None,
     ):
         self.base_url = base_url
         self.dry_run = dry_run
-        self.api_key = api_key
+        self.api_key = api_key or config.KALSHI_API_KEY
+        self.private_key_path = private_key_path or config.KALSHI_PRIVATE_KEY_PATH
         self.timeout = 15.0
         self._order_counter = 0
+
+        # Initialize authenticator for read operations (balance/positions)
+        self._authenticator: Optional[KalshiAuthenticator] = None
+        if self.api_key and self.private_key_path and CRYPTO_AVAILABLE:
+            try:
+                self._authenticator = KalshiAuthenticator(
+                    self.api_key, self.private_key_path
+                )
+            except Exception as e:
+                print(f"[TradingClient] Auth init failed: {e}")
+
+    def _check_safety_gates(self) -> tuple[bool, str]:
+        """
+        Check all safety gates before allowing live trading.
+
+        Returns (allowed, reason) tuple.
+        """
+        if self.dry_run:
+            return False, "dry_run mode enabled"
+
+        if not config.is_live_trading_allowed():
+            status = config.get_live_trading_status()
+            if not status["env_var_set"]:
+                return False, "KALSHI_ENABLE_LIVE_TRADING env var not set to 'true'"
+            if not status["enable_file_exists"]:
+                return False, "./ENABLE_LIVE_TRADING file does not exist"
+            if not status["not_in_ci"]:
+                return False, "Running in CI environment"
+            if not status["no_kill_switch"]:
+                return False, "./STOP_TRADING kill switch active"
+            return False, "Unknown safety gate failure"
+
+        if not self._authenticator:
+            return False, "API credentials not configured"
+
+        return True, "all gates passed"
+
+    async def get_balance(self) -> Dict[str, Any]:
+        """
+        Get account balance - READ ONLY, always safe.
+
+        Returns balance in cents and portfolio value.
+        """
+        if not self._authenticator:
+            return {"success": False, "error": "Not authenticated"}
+
+        endpoint = "/portfolio/balance"
+        try:
+            headers = self._authenticator.sign_request("GET", endpoint)
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers
+                )
+                response.raise_for_status()
+                data = response.json()
+                return {
+                    "success": True,
+                    "balance_cents": data.get("balance", 0),
+                    "balance_dollars": data.get("balance", 0) / 100,
+                    "portfolio_value_cents": data.get("portfolio_value", 0),
+                    "portfolio_value_dollars": data.get("portfolio_value", 0) / 100,
+                }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_positions(self, ticker: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get current positions - READ ONLY, always safe.
+        """
+        if not self._authenticator:
+            return {"success": False, "error": "Not authenticated", "positions": []}
+
+        endpoint = "/portfolio/positions"
+        params = {}
+        if ticker:
+            params["ticker"] = ticker
+
+        try:
+            headers = self._authenticator.sign_request("GET", endpoint)
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers,
+                    params=params
+                )
+                response.raise_for_status()
+                data = response.json()
+                return {
+                    "success": True,
+                    "market_positions": data.get("market_positions", []),
+                    "event_positions": data.get("event_positions", []),
+                }
+        except Exception as e:
+            return {"success": False, "error": str(e), "positions": []}
+
+    def _simulate_realistic_fill(
+        self,
+        market_ticker: str,
+        side: str,
+        quantity: int,
+        price: float,
+    ) -> Dict[str, Any]:
+        """
+        Simulate a realistic order fill with fees, slippage, partial fills, and latency.
+
+        This provides a much more accurate estimate of real trading performance.
+        """
+        self._order_counter += 1
+        order_id = f"DRY-{self._order_counter:06d}"
+
+        # Start with requested values
+        fill_price = price
+        filled_quantity = quantity
+        fees = 0.0
+        slippage = 0.0
+
+        if config.SIM_REALISTIC_MODE:
+            # 1. SLIPPAGE: Price moves against you
+            base_slip = config.SIM_SLIPPAGE_BASE_CENTS
+            size_slip = config.SIM_SLIPPAGE_PER_CONTRACT * quantity
+            volatility = config.SIM_SLIPPAGE_VOLATILITY
+
+            # Random component (always adverse - buying pushes price up)
+            random_slip = random.uniform(0, base_slip + size_slip) * volatility
+            slippage = base_slip + random_slip
+
+            # Apply slippage (worse price for buyer)
+            fill_price = price + slippage
+
+            # 2. LATENCY PRICE MOVEMENT: Price may move during execution delay
+            if random.random() < config.SIM_PRICE_MOVE_PROBABILITY:
+                adverse_move = random.uniform(0, config.SIM_PRICE_MOVE_MAX_CENTS)
+                fill_price += adverse_move
+                slippage += adverse_move
+
+            # Cap fill price at 99 (can't pay more than max)
+            fill_price = min(fill_price, 99.0)
+
+            # 3. PARTIAL FILLS: May not get full quantity
+            if random.random() > config.SIM_FILL_RATE_BASE:
+                # Partial fill
+                fill_rate = random.uniform(config.SIM_MIN_FILL_RATE, 0.95)
+                filled_quantity = max(1, int(quantity * fill_rate))
+
+            # 4. FEES: Kalshi taker fee per contract
+            fees = config.SIM_TAKER_FEE_CENTS * filled_quantity
+
+        # Calculate actual cost
+        cost_cents = fill_price * filled_quantity + fees
+        cost_dollars = cost_cents / 100
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "market_ticker": market_ticker,
+            "side": side,
+            "quantity": quantity,
+            "requested_price": price,
+            "fill_price": round(fill_price, 2),
+            "filled_quantity": filled_quantity,
+            "unfilled_quantity": quantity - filled_quantity,
+            "slippage_cents": round(slippage, 2),
+            "fees_cents": round(fees, 2),
+            "total_cost_cents": round(cost_cents, 2),
+            "total_cost_dollars": round(cost_dollars, 4),
+            "status": "filled" if filled_quantity == quantity else "partial",
+            "dry_run": True,
+            "realistic_mode": config.SIM_REALISTIC_MODE,
+            "timestamp": datetime.now().isoformat(),
+        }
 
     async def place_order(
         self,
@@ -172,53 +434,87 @@ class KalshiTradingClient:
         """
         Place an order on Kalshi.
 
-        In dry-run mode, simulates order fill immediately.
-        In live mode, would submit to Kalshi API.
+        SAFETY: In dry-run mode (default), simulates order fill with realistic
+        slippage, fees, partial fills, and latency.
+        Live trading requires ALL safety gates to pass.
         """
-        self._order_counter += 1
-        order_id = f"DRY-{self._order_counter:06d}" if self.dry_run else None
-
+        # Always check safety gates first
         if self.dry_run:
-            # Simulate immediate fill
-            return {
-                "success": True,
-                "order_id": order_id,
-                "market_ticker": market_ticker,
-                "side": side,
-                "quantity": quantity,
-                "price": price,
-                "filled_quantity": quantity,
-                "status": "filled",
-                "dry_run": True,
-                "timestamp": datetime.now().isoformat(),
-            }
+            # Simulate with realistic market conditions
+            return self._simulate_realistic_fill(market_ticker, side, quantity, price)
 
-        # Live trading would go here
-        if not self.api_key:
+        # Check all safety gates
+        allowed, reason = self._check_safety_gates()
+        if not allowed:
+            print(f"[TradingClient] SAFETY GATE BLOCKED: {reason}")
             return {
                 "success": False,
-                "error": "API key required for live trading",
+                "error": f"Live trading blocked: {reason}",
                 "dry_run": False,
+                "safety_blocked": True,
             }
 
-        # TODO: Implement real Kalshi order submission
-        # This would require:
-        # 1. Authentication with Kalshi API
-        # 2. POST to /trade-api/v2/portfolio/orders
-        # 3. Handle order lifecycle (pending, filled, cancelled)
-        return {
-            "success": False,
-            "error": "Live trading not yet implemented",
-            "dry_run": False,
+        # LIVE TRADING - All gates passed
+        print(f"[TradingClient] LIVE ORDER: {side} {quantity}x {market_ticker} @ {price}c")
+
+        endpoint = "/portfolio/orders"
+        body = {
+            "ticker": market_ticker,
+            "side": side,
+            "action": "buy",
+            "count": quantity,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel",  # Safest option
         }
 
-    async def get_position(self, market_ticker: str) -> Optional[Dict[str, Any]]:
-        """Get current position for a market"""
-        if self.dry_run:
-            return None  # Positions tracked internally in dry-run mode
+        # Set price based on side
+        if side == "yes":
+            body["yes_price"] = int(price)
+        else:
+            body["no_price"] = int(price)
 
-        # TODO: Implement real position fetching
-        return None
+        try:
+            body_json = json.dumps(body)
+            headers = self._authenticator.sign_request("POST", endpoint, body_json)
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers,
+                    content=body_json
+                )
+
+                if response.status_code == 201:
+                    order_data = response.json().get("order", {})
+                    return {
+                        "success": True,
+                        "order_id": order_data.get("order_id"),
+                        "market_ticker": market_ticker,
+                        "side": side,
+                        "quantity": quantity,
+                        "price": price,
+                        "filled_quantity": order_data.get("fill_count", 0),
+                        "status": order_data.get("status", "unknown"),
+                        "dry_run": False,
+                        "timestamp": datetime.now().isoformat(),
+                        "taker_fees": order_data.get("taker_fees", 0),
+                    }
+                else:
+                    error_msg = response.text
+                    print(f"[TradingClient] Order failed: {response.status_code} - {error_msg}")
+                    return {
+                        "success": False,
+                        "error": f"API error {response.status_code}: {error_msg}",
+                        "dry_run": False,
+                    }
+
+        except Exception as e:
+            print(f"[TradingClient] Order exception: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "dry_run": False,
+            }
 
     async def close_position(
         self,
@@ -227,10 +523,77 @@ class KalshiTradingClient:
         quantity: int,
         price: float,
     ) -> Dict[str, Any]:
-        """Close an existing position"""
-        # Closing is just placing an opposite order
-        close_side = "no" if side == "yes" else "yes"
-        return await self.place_order(market_ticker, close_side, quantity, price)
+        """Close an existing position by selling."""
+        # To close: if we bought YES, we sell YES (action=sell)
+        # This is different from placing an opposite order
+
+        if self.dry_run:
+            self._order_counter += 1
+            return {
+                "success": True,
+                "order_id": f"DRY-CLOSE-{self._order_counter:06d}",
+                "market_ticker": market_ticker,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "status": "filled",
+                "dry_run": True,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        # Live close - same safety gates apply
+        allowed, reason = self._check_safety_gates()
+        if not allowed:
+            return {
+                "success": False,
+                "error": f"Live trading blocked: {reason}",
+                "safety_blocked": True,
+            }
+
+        endpoint = "/portfolio/orders"
+        body = {
+            "ticker": market_ticker,
+            "side": side,
+            "action": "sell",  # Selling to close
+            "count": quantity,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel",
+        }
+
+        if side == "yes":
+            body["yes_price"] = int(price)
+        else:
+            body["no_price"] = int(price)
+
+        try:
+            body_json = json.dumps(body)
+            headers = self._authenticator.sign_request("POST", endpoint, body_json)
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}{endpoint}",
+                    headers=headers,
+                    content=body_json
+                )
+
+                if response.status_code == 201:
+                    order_data = response.json().get("order", {})
+                    return {
+                        "success": True,
+                        "order_id": order_data.get("order_id"),
+                        "status": order_data.get("status"),
+                        "filled_quantity": order_data.get("fill_count", 0),
+                        "dry_run": False,
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"API error {response.status_code}",
+                        "dry_run": False,
+                    }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
 
 class TraderAgent(BaseAgent):
@@ -366,58 +729,91 @@ class TraderAgent(BaseAgent):
             print(f"[{self.name}] Order failed: {result.get('error')}")
             return
 
-        # Create position record
+        # Handle realistic simulation results
+        actual_fill_price = result.get("fill_price", price)
+        actual_filled_qty = result.get("filled_quantity", quantity)
+        fees_cents = result.get("fees_cents", 0)
+        slippage_cents = result.get("slippage_cents", 0)
+        total_cost_cents = result.get("total_cost_cents", actual_fill_price * actual_filled_qty)
+        is_partial = result.get("status") == "partial"
+
+        # Skip if we got zero fills
+        if actual_filled_qty == 0:
+            print(f"[{self.name}] Order not filled - no liquidity")
+            return
+
+        # Actual cost in dollars
+        actual_cost = total_cost_cents / 100
+
+        # Create position record with ACTUAL fill values
         position = Position(
             id=result["order_id"],
             timestamp=datetime.now(),
             market_ticker=signal.market_ticker,
             symbol=signal.symbol,
             side=side,
-            quantity=quantity,
-            entry_price=price,
-            current_price=price,
+            quantity=actual_filled_qty,  # Use actual filled quantity
+            entry_price=actual_fill_price,  # Use actual fill price
+            current_price=actual_fill_price,
         )
 
         self.positions[signal.market_ticker] = position
         self.stats.signals_executed += 1
-        self.stats.total_cost += cost
-        self.stats.total_contracts += quantity
+        self.stats.total_cost += actual_cost
+        self.stats.total_contracts += actual_filled_qty
+
+        # Track realistic simulation stats
+        self.stats.total_fees += fees_cents / 100
+        self.stats.total_slippage += (slippage_cents * actual_filled_qty) / 100
+        if is_partial:
+            self.stats.partial_fills += 1
+            self.stats.unfilled_contracts += (quantity - actual_filled_qty)
 
         # Update signal tracking
         signal_key = f"{signal.symbol}_{signal.market_ticker}"
         self._recent_signals[signal_key] = datetime.now()
 
         # Calculate theoretical win probability and expected value
-        # Based on momentum as a proxy for win probability
-        win_prob = signal.confidence / 100  # Use confidence as win probability
-        expected_payout = win_prob * 100 + (1 - win_prob) * 0  # Binary outcome
-        expected_pnl = (expected_payout - price) * quantity / 100
+        # Using ACTUAL fill price, not requested price
+        win_prob = signal.confidence / 100
+        expected_payout = win_prob * 100 + (1 - win_prob) * 0
+        # Account for fees in expected P&L
+        expected_pnl = (expected_payout - actual_fill_price) * actual_filled_qty / 100 - (fees_cents / 100)
 
-        # Kelly criterion for optimal position sizing (informational)
-        # f* = (bp - q) / b where b=odds, p=win prob, q=lose prob
-        b = (100 - price) / price  # Odds (potential win / risk)
+        # Kelly criterion with actual fill price
+        b = (100 - actual_fill_price) / actual_fill_price if actual_fill_price > 0 else 0
         kelly_fraction = (b * win_prob - (1 - win_prob)) / b if b > 0 else 0
-        kelly_fraction = max(0, min(kelly_fraction, 0.25))  # Cap at 25%
+        kelly_fraction = max(0, min(kelly_fraction, 0.25))
 
-        # Log the trade
+        # Log the trade with realistic details
         mode_tag = "[DRY-RUN]" if self.dry_run else "[LIVE]"
+        realistic_tag = " (Realistic)" if result.get("realistic_mode") else ""
+        partial_tag = " [PARTIAL FILL]" if is_partial else ""
+
         print(f"\n{'='*60}")
-        print(f"[{self.name}] {mode_tag} TRADE EXECUTED")
+        print(f"[{self.name}] {mode_tag}{realistic_tag} TRADE EXECUTED{partial_tag}")
         print(f"{'='*60}")
         print(f"  Order ID:     {position.id}")
         print(f"  Market:       {signal.market_ticker}")
         print(f"  Symbol:       {signal.symbol}")
         print(f"  Side:         {side.upper()}")
-        print(f"  Quantity:     {quantity} contracts")
-        print(f"  Price:        {price}c")
-        print(f"  Cost:         ${cost:.2f}")
         print(f"-" * 60)
+        print(f"  EXECUTION DETAILS")
+        print(f"  Requested:    {quantity} contracts @ {price}c")
+        print(f"  Filled:       {actual_filled_qty} contracts @ {actual_fill_price}c")
+        if slippage_cents > 0:
+            print(f"  Slippage:     +{slippage_cents}c (adverse)")
+        if fees_cents > 0:
+            print(f"  Fees:         {fees_cents}c (${fees_cents/100:.2f})")
+        print(f"  Total Cost:   ${actual_cost:.2f}")
+        print(f"-" * 60)
+        print(f"  SIGNAL ANALYSIS")
         print(f"  Confidence:   {signal.confidence}%")
-        print(f"  Expected Edge: {signal.spread}c")
+        print(f"  Expected Edge: {signal.spread}c → {signal.spread - slippage_cents:.1f}c (after slippage)")
         print(f"  Win Prob:     {win_prob*100:.1f}%")
-        print(f"  Expected P&L: ${expected_pnl:.2f}")
-        print(f"  Max Win:      ${(100-price)*quantity/100:.2f}")
-        print(f"  Max Loss:     -${cost:.2f}")
+        print(f"  Expected P&L: ${expected_pnl:.2f} (after fees)")
+        print(f"  Max Win:      ${(100-actual_fill_price)*actual_filled_qty/100:.2f}")
+        print(f"  Max Loss:     -${actual_cost:.2f}")
         print(f"  Kelly %:      {kelly_fraction*100:.1f}%")
         print(f"{'='*60}\n")
 
@@ -558,6 +954,21 @@ class TraderAgent(BaseAgent):
         print(f"  Unrealized P&L:    ${total_unrealized:.2f}")
         print(f"  Total P&L:         ${stats.realized_pnl + total_unrealized:.2f}")
         print(f"  Max Drawdown:      ${stats.max_drawdown:.2f}")
+
+        # Show realistic simulation costs
+        if config.SIM_REALISTIC_MODE and self.dry_run:
+            print(f"-" * 60)
+            print(f"  TRADING FRICTION (Realistic Simulation)")
+            print(f"  Total Fees:        ${stats.total_fees:.2f}")
+            print(f"  Total Slippage:    ${stats.total_slippage:.2f}")
+            print(f"  Total Friction:    ${stats.total_friction:.2f}")
+            if stats.partial_fills > 0:
+                print(f"  Partial Fills:     {stats.partial_fills}")
+                print(f"  Unfilled Contracts: {stats.unfilled_contracts}")
+            print(f"-" * 60)
+            net_pnl = stats.realized_pnl + total_unrealized - stats.total_friction
+            print(f"  NET P&L (after friction): ${net_pnl:.2f}")
+
         print(f"{'='*60}")
 
         # Print open positions detail

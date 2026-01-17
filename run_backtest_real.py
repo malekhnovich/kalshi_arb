@@ -21,8 +21,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -33,8 +32,8 @@ from agents.kalshi_historical import KalshiHistoricalClient
 # Configure logger with file, line, and time
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(filename)s:%(lineno)d | %(levelname)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s | %(filename)s:%(lineno)d | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -42,6 +41,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Trade:
     """Represents a backtest trade."""
+
     timestamp: datetime
     symbol: str
     direction: str  # "YES" or "NO"
@@ -58,6 +58,7 @@ class Trade:
 @dataclass
 class BacktestResult:
     """Results from backtest."""
+
     start_time: datetime
     end_time: datetime
     symbol: str
@@ -116,16 +117,18 @@ class RealKalshiBacktester:
         cache = get_cache()
         current_start = int(self.start_date.timestamp() * 1000)
         end_ms = int(self.end_date.timestamp() * 1000)
-        
+
         # Check cache first
         logger.info(f"Checking cache for Binance data ({self.symbol})...")
         cached_klines = cache.get_binance_klines(self.symbol, current_start, end_ms)
-        
+
         expected_minutes = (end_ms - current_start) / 60000
         coverage = len(cached_klines) / expected_minutes if expected_minutes > 0 else 0
-        
+
         if coverage > 0.95:
-            logger.info(f"Found {len(cached_klines)} candles in cache ({coverage:.1%}). Using cached data.")
+            logger.info(
+                f"Found {len(cached_klines)} candles in cache ({coverage:.1%}). Using cached data."
+            )
             self.binance_klines = cached_klines
             return True
 
@@ -144,8 +147,7 @@ class RealKalshiBacktester:
 
                 try:
                     resp = await client.get(
-                        f"{config.BINANCE_US_API_URL}/klines",
-                        params=params
+                        f"{config.BINANCE_US_API_URL}/klines", params=params
                     )
                     resp.raise_for_status()
                     klines = resp.json()
@@ -161,11 +163,11 @@ class RealKalshiBacktester:
                     break
 
         self.binance_klines = all_klines
-        
+
         if all_klines:
             logger.info(f"Saving {len(all_klines)} candles to cache...")
             cache.save_binance_klines(self.symbol, all_klines)
-            
+
         logger.info(f"Loaded {len(self.binance_klines)} Binance candles")
         return len(self.binance_klines) > 0
 
@@ -208,9 +210,13 @@ class RealKalshiBacktester:
 
         # Filter out low volume markets to save time and avoid noise
         original_count = len(self.kalshi_markets)
-        self.kalshi_markets = [m for m in self.kalshi_markets if m.get("volume", 0) > 100]
+        self.kalshi_markets = [
+            m for m in self.kalshi_markets if m.get("volume", 0) > 100
+        ]
         if len(self.kalshi_markets) < original_count:
-            logger.info(f"Filtered out {original_count - len(self.kalshi_markets)} low-volume markets (< 100 volume)")
+            logger.info(
+                f"Filtered out {original_count - len(self.kalshi_markets)} low-volume markets (< 100 volume)"
+            )
 
         # Check cache for these specific markets
         cache = get_cache()
@@ -238,7 +244,9 @@ class RealKalshiBacktester:
         for i, market in enumerate(self.kalshi_markets):
             ticker = market["ticker"]
             if i % 10 == 0:
-                logger.info(f"Fetching trades for market {i+1}/{len(self.kalshi_markets)}: {ticker}")
+                logger.info(
+                    f"Fetching trades for market {i + 1}/{len(self.kalshi_markets)}: {ticker}"
+                )
 
             trades = await self.kalshi_client.get_trades(
                 ticker=ticker,
@@ -260,16 +268,18 @@ class RealKalshiBacktester:
                     if ts not in self.kalshi_candles:
                         self.kalshi_candles[ts] = []
 
-                    self.kalshi_candles[ts].append({
-                        "yes_price": trade.get("yes_price", 50),
-                        "no_price": trade.get("no_price", 50),
-                        "market_ticker": trade.get("ticker", ""),
-                        "market_result": market_results.get(trade.get("ticker")),
-                    })
+                    self.kalshi_candles[ts].append(
+                        {
+                            "yes_price": trade.get("yes_price", 50),
+                            "no_price": trade.get("no_price", 50),
+                            "market_ticker": trade.get("ticker", ""),
+                            "market_result": market_results.get(trade.get("ticker")),
+                        }
+                    )
                     total_candles += 1
                 except (ValueError, TypeError):
                     continue
-            
+
             # Small sleep to respect rate limits
             await asyncio.sleep(0.1)
 
@@ -284,7 +294,7 @@ class RealKalshiBacktester:
         """Get Kalshi trade data closest to given timestamp."""
         ts = int(timestamp.timestamp())
         ts = ts - (ts % 60)  # Round to minute
-        
+
         candidates = []
 
         # Exact match first
@@ -306,7 +316,9 @@ class RealKalshiBacktester:
         # If multiple markets active, pick the one with price closest to 50c
         # This assumes the "active" market is the one being contested
         if isinstance(candidates, list):
-            best_market = min(candidates, key=lambda x: abs(x.get("yes_price", 50) - 50))
+            best_market = min(
+                candidates, key=lambda x: abs(x.get("yes_price", 50) - 50)
+            )
             return best_market
         return candidates
 
@@ -352,7 +364,9 @@ class RealKalshiBacktester:
 
             uptrend = recent_high > older_high and recent_low > older_low
             downtrend = recent_high < older_high and recent_low < older_low
-            trend_confirmed = (momentum >= 60 and uptrend) or (momentum <= 40 and downtrend)
+            trend_confirmed = (momentum >= 60 and uptrend) or (
+                momentum <= 40 and downtrend
+            )
 
         return momentum, trend_confirmed
 
@@ -396,7 +410,9 @@ class RealKalshiBacktester:
         neutrality_bonus = max(0, (5 - center_distance) / 5 * 5)
         trend_bonus = 5.0 if trend_confirmed else 0.0
 
-        confidence = min(base_confidence + spread_bonus + neutrality_bonus + trend_bonus, 95)
+        confidence = min(
+            base_confidence + spread_bonus + neutrality_bonus + trend_bonus, 95
+        )
 
         return direction, confidence, spread
 
@@ -432,7 +448,7 @@ class RealKalshiBacktester:
 
             # Get recent candles for momentum
             # FIX: Only use COMPLETED candles (up to i-1) to avoid lookahead bias
-            recent = self.binance_klines[i - window:i]
+            recent = self.binance_klines[i - window : i]
             momentum, trend_confirmed = self.calculate_momentum(recent)
 
             # Get real Kalshi data at this time
@@ -480,8 +496,9 @@ class RealKalshiBacktester:
                 if age_minutes >= 60:
                     # Use actual market result if available
                     if trade.market_result:
-                        won = (trade.direction == "YES" and trade.market_result == "yes") or \
-                              (trade.direction == "NO" and trade.market_result == "no")
+                        won = (
+                            trade.direction == "YES" and trade.market_result == "yes"
+                        ) or (trade.direction == "NO" and trade.market_result == "no")
                     else:
                         # Skip resolution if we don't have the real market result
                         continue
@@ -539,7 +556,9 @@ class RealKalshiBacktester:
         print("  BACKTEST RESULTS (Real Kalshi Data)")
         print("=" * 60)
         print(f"  Symbol:           {result.symbol}")
-        print(f"  Period:           {result.start_time.date()} to {result.end_time.date()}")
+        print(
+            f"  Period:           {result.start_time.date()} to {result.end_time.date()}"
+        )
         print(f"  Initial Capital:  ${self.initial_capital:,.2f}")
         print("-" * 60)
         print(f"  DATA QUALITY")
@@ -559,7 +578,9 @@ class RealKalshiBacktester:
         print(f"  Avg Trade P&L:    ${result.avg_trade_pnl:,.2f}")
         print(f"  Max Drawdown:     ${result.max_drawdown:,.2f}")
         print(f"  Final Capital:    ${self.capital:,.2f}")
-        print(f"  Return:           {((self.capital / self.initial_capital) - 1) * 100:.1f}%")
+        print(
+            f"  Return:           {((self.capital / self.initial_capital) - 1) * 100:.1f}%"
+        )
         print("=" * 60 + "\n")
 
     async def _save_results(self, result: BacktestResult):
@@ -595,27 +616,48 @@ class RealKalshiBacktester:
             ],
         }
 
-        path = config.LOG_DIR / f"backtest_real_{result.symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path = (
+            config.LOG_DIR
+            / f"backtest_real_{result.symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(path, "w") as f:
             json.dump(output, f, indent=2)
 
         # Save CSV for easier analysis
-        csv_path = path.with_suffix('.csv')
-        with open(csv_path, 'w', newline='') as f:
+        csv_path = path.with_suffix(".csv")
+        with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                'Timestamp', 'Symbol', 'Direction', 'Entry Price', 'Exit Price', 
-                'PnL', 'Confidence', 'Momentum', 'Market Ticker', 'Result'
-            ])
+            writer.writerow(
+                [
+                    "Timestamp",
+                    "Symbol",
+                    "Direction",
+                    "Entry Price",
+                    "Exit Price",
+                    "PnL",
+                    "Confidence",
+                    "Momentum",
+                    "Market Ticker",
+                    "Result",
+                ]
+            )
             for t in result.trades:
-                writer.writerow([
-                    t.timestamp.isoformat(), t.symbol, t.direction, 
-                    t.entry_price, t.exit_price, round(t.pnl, 2), 
-                    t.confidence, round(t.spot_momentum, 2), 
-                    t.market_ticker, t.market_result
-                ])
+                writer.writerow(
+                    [
+                        t.timestamp.isoformat(),
+                        t.symbol,
+                        t.direction,
+                        t.entry_price,
+                        t.exit_price,
+                        round(t.pnl, 2),
+                        t.confidence,
+                        round(t.spot_momentum, 2),
+                        t.market_ticker,
+                        t.market_result,
+                    ]
+                )
 
         logger.info(f"Results saved to {path}")
         logger.info(f"CSV export saved to {csv_path}")
@@ -624,7 +666,9 @@ class RealKalshiBacktester:
 async def main():
     parser = argparse.ArgumentParser(description="Backtest with real Kalshi data")
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading symbol")
-    parser.add_argument("--days", type=int, default=7, help="Number of days to backtest")
+    parser.add_argument(
+        "--days", type=int, default=7, help="Number of days to backtest"
+    )
     parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", help="End date (YYYY-MM-DD)")
     parser.add_argument("--capital", type=float, default=10000, help="Initial capital")

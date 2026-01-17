@@ -1,10 +1,8 @@
-"""
-Arbitrage Detector Agent - Detects temporal lag between spot momentum and Kalshi odds.
-"""
-
 import asyncio
+import math
+import statistics
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict
 
 from .base import BaseAgent
 from events import (
@@ -36,11 +34,13 @@ class ArbitrageDetectorAgent(BaseAgent):
         self._kalshi_data: Dict[str, KalshiOddsEvent] = {}
         self._last_signal_time: Dict[str, datetime] = {}
         self._momentum_history: Dict[str, list] = {}  # Track momentum for acceleration
+        self._price_history: Dict[str, list] = {}  # Track prices for volatility
 
         # Configurable thresholds
         self.confidence_threshold = config.CONFIDENCE_THRESHOLD
         self.min_odds_spread = config.MIN_ODDS_SPREAD
         self.neutral_range = config.ODDS_NEUTRAL_RANGE
+        self.strike_distance_threshold = config.STRIKE_DISTANCE_THRESHOLD_PCT / 100
         self.signal_cooldown = timedelta(seconds=60)  # Avoid spam
 
     async def on_start(self) -> None:
@@ -52,6 +52,14 @@ class ArbitrageDetectorAgent(BaseAgent):
         """Handle incoming price update"""
         if isinstance(event, PriceUpdateEvent):
             self._price_data[event.symbol] = event
+
+            # Track price history for volatility
+            if event.symbol not in self._price_history:
+                self._price_history[event.symbol] = []
+            self._price_history[event.symbol].append(event.price)
+            if len(self._price_history[event.symbol]) > 60:  # 1 hour of history
+                self._price_history[event.symbol].pop(0)
+
             await self._check_arbitrage(event.symbol)
 
     async def _handle_kalshi_odds(self, event: BaseEvent) -> None:
@@ -88,9 +96,7 @@ class ArbitrageDetectorAgent(BaseAgent):
             await self._evaluate_opportunity(price_event, kalshi_event)
 
     async def _evaluate_opportunity(
-        self,
-        price_event: PriceUpdateEvent,
-        kalshi_event: KalshiOddsEvent
+        self, price_event: PriceUpdateEvent, kalshi_event: KalshiOddsEvent
     ) -> None:
         """Evaluate if there's an exploitable opportunity"""
         # Use event timestamp (supports backtesting with simulated time)
@@ -148,8 +154,39 @@ class ArbitrageDetectorAgent(BaseAgent):
         # Check if Kalshi odds are neutral (mispriced)
         odds_neutral = neutral_range[0] <= yes_price <= neutral_range[1]
 
+        # IMPROVEMENT 6: Strike price distance check
+        strike_price = kalshi_event.strike_price
+        dist_check = True
+        if strike_price:
+            distance_pct = abs(price_event.price - strike_price) / strike_price
+            dist_check = distance_pct <= self.strike_distance_threshold
+
+        # Debug logging for skipped signals (only log if momentum is significant)
+        if (strong_up or strong_down) and not (
+            odds_neutral and is_accelerating and dist_check
+        ):
+            # Calculate what failure caused the skip
+            reasons = []
+            if not odds_neutral:
+                reasons.append(f"NotNeutral({yes_price}c)")
+            if not is_accelerating:
+                reasons.append("Decelerating")
+            if not dist_check:
+                reasons.append(
+                    f"TooFar({distance_pct * 100:.1f}% > {self.strike_distance_threshold * 100}%)"
+                )
+
+            print(
+                f"[{self.name}] Skipping {symbol}: Momentum={momentum:.1f}, Reasons={', '.join(reasons)}"
+            )
+
         # Arbitrage exists if spot is directional but odds are neutral
-        if (strong_up or strong_down) and odds_neutral and is_accelerating:
+        if (
+            (strong_up or strong_down)
+            and odds_neutral
+            and is_accelerating
+            and dist_check
+        ):
             direction = "UP" if strong_up else "DOWN"
 
             # Only signal if spread is significant
@@ -165,7 +202,23 @@ class ArbitrageDetectorAgent(BaseAgent):
                 neutrality_bonus = max(0, (5 - center_distance) / 5 * 5)  # +5 if at 50
 
                 # Combine factors (including trend bonus from improvement 4)
-                confidence = min(base_confidence + spread_bonus + neutrality_bonus + trend_bonus, 95)
+                confidence = min(
+                    base_confidence + spread_bonus + neutrality_bonus + trend_bonus, 95
+                )
+
+                # IMPROVEMENT 7: Calculate fair probability
+                fair_prob = 50.0
+                strike_price = kalshi_event.strike_price
+                if strike_price:
+                    fair_prob = self._calculate_fair_probability(
+                        price_event.symbol, strike_price, price_event.price
+                    )
+
+                # Adjust confidence based on fair probability confirmation
+                if direction == "UP" and fair_prob > 60:
+                    confidence = min(confidence + 5, 98)
+                elif direction == "DOWN" and fair_prob < 40:
+                    confidence = min(confidence + 5, 98)
 
                 recommendation = self._generate_recommendation(
                     direction, kalshi_event, yes_price, momentum
@@ -181,7 +234,8 @@ class ArbitrageDetectorAgent(BaseAgent):
                     kalshi_no_price=kalshi_event.no_price,
                     market_ticker=kalshi_event.market_ticker,
                     spread=round(spread, 1),
-                    recommendation=recommendation
+                    fair_probability=round(fair_prob, 1),
+                    recommendation=recommendation,
                 )
 
                 await self.publish(signal)
@@ -192,7 +246,7 @@ class ArbitrageDetectorAgent(BaseAgent):
         direction: str,
         kalshi_event: KalshiOddsEvent,
         yes_price: float,
-        momentum: float
+        momentum: float,
     ) -> str:
         """Generate actionable recommendation"""
         if direction == "UP":
@@ -207,6 +261,37 @@ class ArbitrageDetectorAgent(BaseAgent):
             f"(current: {yes_price}c, expected: ~{momentum:.0f}c based on spot). "
             f"Expected edge: {expected_value:.1f}c"
         )
+
+    def _calculate_fair_probability(
+        self, symbol: str, strike_price: float, current_price: float
+    ) -> float:
+        """Calculate theoretical probability of price > strike using volatility"""
+        history = self._price_history.get(symbol, [])
+        if len(history) < 10:
+            return 50.0  # Default if not enough data
+
+        # Calculate returns for volatility estimation
+        returns = []
+        for i in range(1, len(history)):
+            returns.append((history[i] - history[i - 1]) / history[i - 1])
+
+        if not returns:
+            return 50.0
+
+        volatility = statistics.stdev(returns) if len(returns) > 1 else 0.001
+        if volatility == 0:
+            volatility = 0.0001
+
+        # Distance to strike in standard deviations
+        # Simplified model: assume price follows random walk over very short term
+        # Standard deviation scales with sqrt(time), but we'll use a fixed short-term proxy
+        dist_pct = (strike_price - current_price) / current_price
+        z_score = dist_pct / volatility
+
+        # Calculate probability using error function (approximating Normal CDF)
+        # P(X > strike) = 1 - CDF(z)
+        prob = 0.5 * (1 - math.erf(z_score / math.sqrt(2)))
+        return prob * 100
 
     async def run(self) -> None:
         """Main loop - just sleep as we're event-driven"""

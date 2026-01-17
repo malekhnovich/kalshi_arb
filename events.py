@@ -19,6 +19,7 @@ class EventType(Enum):
 @dataclass
 class BaseEvent:
     """Base class for all events"""
+
     timestamp: datetime = field(default_factory=datetime.now)
     event_type: EventType = field(init=False)
 
@@ -38,6 +39,7 @@ class BaseEvent:
 @dataclass
 class PriceUpdateEvent(BaseEvent):
     """Event emitted when price data is updated"""
+
     symbol: str = ""
     price: float = 0.0
     volume_24h: float = 0.0
@@ -54,6 +56,7 @@ class PriceUpdateEvent(BaseEvent):
 @dataclass
 class KalshiOddsEvent(BaseEvent):
     """Event emitted when Kalshi market odds are updated"""
+
     market_ticker: str = ""
     market_title: str = ""
     yes_price: float = 0.0  # Price in cents (0-100)
@@ -71,6 +74,7 @@ class KalshiOddsEvent(BaseEvent):
 @dataclass
 class ArbitrageSignalEvent(BaseEvent):
     """Event emitted when arbitrage opportunity is detected"""
+
     symbol: str = ""
     direction: str = ""  # "UP" or "DOWN"
     confidence: float = 0.0  # 0-100
@@ -79,6 +83,7 @@ class ArbitrageSignalEvent(BaseEvent):
     kalshi_no_price: float = 0.0
     market_ticker: str = ""
     spread: float = 0.0  # Difference between expected odds and actual
+    fair_probability: float = 50.0  # Volatility-based theoretical probability
     recommendation: str = ""
 
     def __post_init__(self):
@@ -88,6 +93,7 @@ class ArbitrageSignalEvent(BaseEvent):
 @dataclass
 class AlertEvent(BaseEvent):
     """Aggregated alert event for actionable opportunities"""
+
     level: str = "INFO"  # INFO, WARNING, OPPORTUNITY
     message: str = ""
     source_agent: str = ""
@@ -148,15 +154,12 @@ class EventBus:
         """Process events from the queue and dispatch to handlers"""
         while self._running:
             try:
-                event = await asyncio.wait_for(
-                    self._event_queue.get(),
-                    timeout=0.1
-                )
+                event = await asyncio.wait_for(self._event_queue.get(), timeout=0.1)
                 handlers = self._subscribers.get(event.event_type, [])
                 if handlers:
                     await asyncio.gather(
                         *[handler(event) for handler in handlers],
-                        return_exceptions=True
+                        return_exceptions=True,
                     )
             except asyncio.TimeoutError:
                 continue

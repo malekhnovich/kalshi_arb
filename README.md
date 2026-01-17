@@ -25,8 +25,8 @@ When Binance shows strong directional momentum (≥70% up candles) but Kalshi pr
 │ PriceMonitor  │  │  KalshiMonitor  │  │  ArbitrageDetector   │
 │   Agent       │  │     Agent       │  │       Agent          │
 │               │  │                 │  │                      │
-│ Polls Binance │  │ Polls Kalshi    │  │ Detects lag between  │
-│ every 5s      │  │ every 10s       │  │ spot & prediction    │
+│ Uses WebSocket│  │ Uses WebSocket  │  │ Uses Strike-Price    │
+│ (fallback REST)│  │ (fallback REST) │  │ & Probability logic  │
 └───────────────┘  └─────────────────┘  └──────────────────────┘
         │                    │                    │
         └────────────────────┴────────────────────┘
@@ -64,19 +64,27 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Run Live Agent System
-
 Monitor real-time prices and detect arbitrage opportunities:
 
 ```bash
-# Standard run
+# Standard run (uses WebSockets by default)
 python run_agents.py
 
 # With debug logging
 python run_agents.py --debug
 ```
 
-Press `Ctrl+C` to stop gracefully.
+### Run Trading System (Dry-Run or Live)
+
+The trading agent executes simulated trades (dry-run) or actual trades (live) based on signals.
+
+```bash
+# Recommended for testing (saves output to log file)
+python run_trader.py | tee logs/dryrun_$(date +%Y%m%d_%H%M%S).log
+
+# Live trading (requires following all safety gates)
+python run_trader.py --live
+```
 
 ### Run Backtesting
 
@@ -108,11 +116,17 @@ python binance_mcp_server.py
 ```
 
 Available tools:
-- `binance_get_order_book` - Get bid/ask depth
-- `binance_get_ticker` - Get 24h price stats
-- `binance_get_klines` - Get candlestick data
-- `binance_analyze_price_momentum` - Momentum analysis
-- `binance_detect_temporal_lag` - Lag detection
+#### 1. Analyze Momentum
+Calculate % of recent candles closing higher (Hybrid volume-weighted).
+
+#### 2. Statistical Confirmation
+Calculate the theoretical probability of settlement using recent price volatility.
+
+#### 3. Detect Lag
+Identify when spot momentum is strong but Kalshi odds remain neutral, provided the spot price is within the strike distance threshold (default 0.5%).
+
+#### 4. Execution
+Execute trades in dry-run or live mode with realistic simulation (fees, slippage).
 
 ## Configuration
 
@@ -122,8 +136,9 @@ Configuration is managed in `config.py` with environment variable overrides:
 |----------|---------|-------------|
 | `BINANCE_API_URL` | `https://api.binance.us/api/v3` | Binance.US API endpoint |
 | `KALSHI_API_URL` | `https://api.elections.kalshi.com/trade-api/v2` | Kalshi API endpoint |
-| `POLL_INTERVAL_BINANCE` | `5` | Binance polling interval (seconds) |
-| `POLL_INTERVAL_KALSHI` | `10` | Kalshi polling interval (seconds) |
+| `BINANCE_WS_ENABLED` | `true` | Enable real-time Binance price stream |
+| `KALSHI_WS_ENABLED` | `true` | Enable real-time Kalshi odds stream |
+| `STRIKE_DISTANCE_THRESHOLD_PCT` | `0.5` | Max % distance to strike for signal |
 | `MOMENTUM_WINDOW` | `60` | Minutes to analyze for momentum |
 | `CONFIDENCE_THRESHOLD` | `70` | Minimum confidence % for signals |
 | `MIN_ODDS_SPREAD` | `10.0` | Minimum spread (cents) for opportunity |
