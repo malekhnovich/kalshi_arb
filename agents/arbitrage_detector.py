@@ -3,6 +3,7 @@ import math
 import statistics
 from datetime import datetime, timedelta
 from typing import Dict
+from collections import deque
 
 from .base import BaseAgent
 from events import (
@@ -14,6 +15,7 @@ from events import (
     ArbitrageSignalEvent,
 )
 import config
+import strategies
 
 
 class ArbitrageDetectorAgent(BaseAgent):
@@ -35,6 +37,8 @@ class ArbitrageDetectorAgent(BaseAgent):
         self._last_signal_time: Dict[str, datetime] = {}
         self._momentum_history: Dict[str, list] = {}  # Track momentum for acceleration
         self._price_history: Dict[str, list] = {}  # Track prices for volatility
+        self._price_peaks: Dict[str, float] = {}  # Track recent price peaks for pullback
+        self._open_positions: Dict[str, datetime] = {}  # Track open positions by symbol
 
         # Configurable thresholds
         self.confidence_threshold = config.CONFIDENCE_THRESHOLD
@@ -42,6 +46,13 @@ class ArbitrageDetectorAgent(BaseAgent):
         self.neutral_range = config.ODDS_NEUTRAL_RANGE
         self.strike_distance_threshold = config.STRIKE_DISTANCE_THRESHOLD_PCT / 100
         self.signal_cooldown = timedelta(seconds=60)  # Avoid spam
+
+        # Load strategies
+        self._load_strategies()
+
+    def _load_strategies(self) -> None:
+        """Load strategy configuration from strategies module"""
+        print(f"\n{strategies.get_strategy_summary()}")
 
     async def on_start(self) -> None:
         """Subscribe to price and odds events"""
@@ -119,37 +130,43 @@ class ArbitrageDetectorAgent(BaseAgent):
         if len(self._momentum_history[symbol]) > 5:
             self._momentum_history[symbol].pop(0)
 
-        # Check momentum acceleration - skip if momentum is decelerating
-        history = self._momentum_history[symbol]
+        # STRATEGY: Momentum Acceleration Filter
         is_accelerating = True
-        if len(history) >= 3:
-            recent_avg = sum(history[-2:]) / 2
-            older_avg = sum(history[:-2]) / max(1, len(history) - 2)
-            # For bullish: recent should be higher; for bearish: recent should be lower
-            if momentum >= 50:
-                is_accelerating = recent_avg >= older_avg - 2  # Allow small decel
-            else:
-                is_accelerating = recent_avg <= older_avg + 2
+        if strategies.STRATEGY_MOMENTUM_ACCELERATION:
+            history = self._momentum_history[symbol]
+            if len(history) >= 3:
+                recent_avg = sum(history[-2:]) / 2
+                older_avg = sum(history[:-2]) / max(1, len(history) - 2)
+                # For bullish: recent should be higher; for bearish: recent should be lower
+                if momentum >= 50:
+                    is_accelerating = recent_avg >= older_avg - 2  # Allow small decel
+                else:
+                    is_accelerating = recent_avg <= older_avg + 2
 
         # Determine if spot shows strong direction
         strong_up = momentum >= self.confidence_threshold
         strong_down = momentum <= (100 - self.confidence_threshold)
 
-        # IMPROVEMENT 4: Trend confirmation as confidence boost (not hard filter)
-        trend_bonus = 5.0 if price_event.trend_confirmed else 0.0
+        # STRATEGY: Trend Confirmation
+        trend_bonus = 0.0
+        if strategies.STRATEGY_TREND_CONFIRMATION and price_event.trend_confirmed:
+            trend_bonus = 5.0
 
         # Calculate expected spread first (needed for dynamic range)
         expected_odds = momentum if strong_up else (100 - momentum)
         spread = abs(expected_odds - yes_price)
 
-        # IMPROVEMENT 3: Dynamic neutral range based on spread size
+        # STRATEGY: Dynamic Neutral Range
         # Larger spreads = more tolerance, smaller spreads = stricter
-        if spread >= 25:
-            neutral_range = (40, 60)  # Wide range for huge edges
-        elif spread >= 15:
-            neutral_range = (45, 55)  # Standard range
+        if strategies.STRATEGY_DYNAMIC_NEUTRAL_RANGE:
+            if spread >= 25:
+                neutral_range = (40, 60)  # Wide range for huge edges
+            elif spread >= 15:
+                neutral_range = (45, 55)  # Standard range
+            else:
+                neutral_range = (47, 53)  # Tight range for small edges
         else:
-            neutral_range = (47, 53)  # Tight range for small edges
+            neutral_range = self.neutral_range  # Use default from config
 
         # Check if Kalshi odds are neutral (mispriced)
         odds_neutral = neutral_range[0] <= yes_price <= neutral_range[1]
@@ -163,7 +180,7 @@ class ArbitrageDetectorAgent(BaseAgent):
 
         # Debug logging for skipped signals (only log if momentum is significant)
         if (strong_up or strong_down) and not (
-            odds_neutral and is_accelerating and dist_check
+            odds_neutral and is_accelerating and dist_check and vol_passes and pullback_passes and time_passes and corr_passes
         ):
             # Calculate what failure caused the skip
             reasons = []
@@ -175,10 +192,30 @@ class ArbitrageDetectorAgent(BaseAgent):
                 reasons.append(
                     f"TooFar({distance_pct * 100:.1f}% > {self.strike_distance_threshold * 100}%)"
                 )
+            if not vol_passes:
+                reasons.append(f"Volatility({vol_reason})")
+            if not pullback_passes:
+                reasons.append(f"Pullback({pullback_reason})")
+            if not time_passes:
+                reasons.append(f"Time({time_reason})")
+            if not corr_passes:
+                reasons.append(f"Correlation({corr_reason})")
 
             print(
                 f"[{self.name}] Skipping {symbol}: Momentum={momentum:.1f}, Reasons={', '.join(reasons)}"
             )
+
+        # STRATEGY: Apply all filters before generating signal
+        # Check additional strategy filters
+        vol_passes, vol_reason = self._check_volatility_filter(symbol)
+        pullback_passes, pullback_reason = self._check_pullback_entry(symbol, price_event.price)
+        time_passes, time_reason = self._check_time_filter(event_time)
+        corr_passes, corr_reason = self._check_correlation(symbol)
+
+        # Determine minimum spread based on strategy
+        min_spread = self.min_odds_spread
+        if strategies.STRATEGY_TIGHT_SPREAD_FILTER:
+            min_spread = max(min_spread, strategies.STRATEGY_MIN_SPREAD_CENTS)
 
         # Arbitrage exists if spot is directional but odds are neutral
         if (
@@ -186,22 +223,30 @@ class ArbitrageDetectorAgent(BaseAgent):
             and odds_neutral
             and is_accelerating
             and dist_check
+            and vol_passes
+            and pullback_passes
+            and time_passes
+            and corr_passes
         ):
             direction = "UP" if strong_up else "DOWN"
 
             # Only signal if spread is significant
-            if spread >= self.min_odds_spread:
-                # IMPROVEMENT 5: Scale confidence by edge quality
+            if spread >= min_spread:
+                # STRATEGY: Improved Confidence Formula
                 base_confidence = momentum if strong_up else (100 - momentum)
 
-                # Boost for larger spreads (more mispricing = higher confidence)
-                spread_bonus = min(spread / 30 * 10, 10)  # Up to +10 for 30c+ spread
+                spread_bonus = 0.0
+                neutrality_bonus = 0.0
 
-                # Boost if odds are very neutral (closer to 50 = more mispriced)
-                center_distance = abs(yes_price - 50)
-                neutrality_bonus = max(0, (5 - center_distance) / 5 * 5)  # +5 if at 50
+                if strategies.STRATEGY_IMPROVED_CONFIDENCE:
+                    # Boost for larger spreads (more mispricing = higher confidence)
+                    spread_bonus = min(spread / 30 * 10, 10)  # Up to +10 for 30c+ spread
 
-                # Combine factors (including trend bonus from improvement 4)
+                    # Boost if odds are very neutral (closer to 50 = more mispriced)
+                    center_distance = abs(yes_price - 50)
+                    neutrality_bonus = max(0, (5 - center_distance) / 5 * 5)  # +5 if at 50
+
+                # Combine factors (including trend bonus)
                 confidence = min(
                     base_confidence + spread_bonus + neutrality_bonus + trend_bonus, 95
                 )
@@ -241,6 +286,10 @@ class ArbitrageDetectorAgent(BaseAgent):
                 await self.publish(signal)
                 self._last_signal_time[signal_key] = event_time
 
+                # Track open position for correlation check
+                if strategies.STRATEGY_CORRELATION_CHECK:
+                    self._open_positions[symbol] = event_time
+
     def _generate_recommendation(
         self,
         direction: str,
@@ -261,6 +310,98 @@ class ArbitrageDetectorAgent(BaseAgent):
             f"(current: {yes_price}c, expected: ~{momentum:.0f}c based on spot). "
             f"Expected edge: {expected_value:.1f}c"
         )
+
+    def _check_volatility_filter(self, symbol: str) -> tuple[bool, str]:
+        """
+        STRATEGY: Volatility Filter
+        Skip trades during high volatility periods.
+        Returns: (passes_filter, reason)
+        """
+        if not strategies.STRATEGY_VOLATILITY_FILTER:
+            return True, "disabled"
+
+        history = self._price_history.get(symbol, [])
+        if len(history) < 10:
+            return True, "not_enough_data"
+
+        # Calculate volatility as stdev of returns
+        returns = []
+        for i in range(1, len(history)):
+            if history[i - 1] != 0:
+                returns.append((history[i] - history[i - 1]) / history[i - 1])
+
+        if not returns:
+            return True, "no_returns"
+
+        volatility = statistics.stdev(returns) if len(returns) > 1 else 0.001
+
+        passes = volatility <= strategies.STRATEGY_VOLATILITY_THRESHOLD
+        reason = (
+            "ok"
+            if passes
+            else f"high_vol({volatility:.4f}>{strategies.STRATEGY_VOLATILITY_THRESHOLD})"
+        )
+        return passes, reason
+
+    def _check_pullback_entry(self, symbol: str, current_price: float) -> tuple[bool, str]:
+        """
+        STRATEGY: Pullback Entry
+        Wait for price to pull back from recent peak before entering.
+        Returns: (passes_filter, reason)
+        """
+        if not strategies.STRATEGY_PULLBACK_ENTRY:
+            return True, "disabled"
+
+        history = self._price_history.get(symbol, [])
+        if len(history) < 5:
+            return True, "not_enough_data"
+
+        # Find peak in recent history
+        peak = max(history[-10:])
+        pullback_pct = (peak - current_price) / peak if peak > 0 else 0
+
+        passes = pullback_pct >= (strategies.STRATEGY_PULLBACK_THRESHOLD / 100)
+        reason = (
+            "ok"
+            if passes
+            else f"no_pullback({pullback_pct*100:.2f}%<{strategies.STRATEGY_PULLBACK_THRESHOLD}%)"
+        )
+        return passes, reason
+
+    def _check_time_filter(self, timestamp: datetime) -> tuple[bool, str]:
+        """
+        STRATEGY: Time Filter
+        Only trade during active hours (UTC).
+        Returns: (passes_filter, reason)
+        """
+        if not strategies.STRATEGY_TIME_FILTER:
+            return True, "disabled"
+
+        hour = timestamp.hour
+        start = strategies.STRATEGY_TRADING_HOURS_START
+        end = strategies.STRATEGY_TRADING_HOURS_END
+
+        # Handle case where end < start (e.g., 22:00 to 6:00 wraps midnight)
+        if start < end:
+            passes = start <= hour < end
+        else:
+            passes = hour >= start or hour < end
+
+        reason = "ok" if passes else f"outside_hours({hour}h not in {start}-{end}h)"
+        return passes, reason
+
+    def _check_correlation(self, symbol: str) -> tuple[bool, str]:
+        """
+        STRATEGY: Correlation Check
+        Skip if already holding position on same symbol.
+        Returns: (passes_filter, reason)
+        """
+        if not strategies.STRATEGY_CORRELATION_CHECK:
+            return True, "disabled"
+
+        has_position = symbol in self._open_positions
+        reason = "ok" if not has_position else f"already_open"
+        return not has_position, reason
 
     def _calculate_fair_probability(
         self, symbol: str, strike_price: float, current_price: float

@@ -11,6 +11,7 @@ import base64
 import logging
 import time
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -121,10 +122,12 @@ class KalshiHistoricalClient:
         method: str,
         endpoint: str,
         params: Optional[Dict] = None,
+        retry_count: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """Make authenticated request to Kalshi API with basic rate limiting."""
         url = f"{self.base_url}{endpoint}"
         headers = self.auth.get_auth_headers(method, endpoint)
+        print(f"Making request: {url}")
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
@@ -150,9 +153,17 @@ class KalshiHistoricalClient:
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code == 429:
-                    logger.warning("Rate limit hit! Backing off...")
-                    await asyncio.sleep(1.0)
-                    return await self._request(method, endpoint, params)
+                    if retry_count >= 3:
+                        logger.error(f"Rate limit hit max retries for {endpoint}")
+                        return None
+
+                    logger.warning(
+                        f"Rate limit hit! Backing off... (attempt {retry_count + 1})"
+                    )
+                    await asyncio.sleep(1.0 * (retry_count + 1))
+                    return await self._request(
+                        method, endpoint, params, retry_count + 1
+                    )
                 else:
                     logger.warning(
                         f"{endpoint} returned {resp.status_code}: {resp.text[:200]}"
@@ -279,6 +290,12 @@ class KalshiHistoricalClient:
         series_ticker: Optional[str] = None,
         status: str = "settled",
         limit: int = 100,
+        max_close_ts: int = int(
+            (datetime.today() - timedelta(days=1)).timestamp() * 1000
+        ),
+        min_close_ts: int = int(
+            (datetime.today() - timedelta(days=7)).timestamp() * 1000
+        ),
     ) -> List[Dict[str, Any]]:
         """
         Fetch markets with optional filters.
@@ -293,7 +310,10 @@ class KalshiHistoricalClient:
         """
         endpoint = "/markets"
         params = {"status": status, "limit": limit}
-
+        if max_close_ts:
+            params["max_close_ts"] = max_close_ts
+        if min_close_ts:
+            params["min_close_ts"] = min_close_ts
         if series_ticker:
             params["series_ticker"] = series_ticker
 
@@ -312,7 +332,7 @@ class KalshiHistoricalClient:
             all_markets.extend(markets)
 
             cursor = data.get("cursor")
-            if not cursor or len(markets) < limit:
+            if not cursor or len(markets) <= limit:
                 break
 
             # Rate limiting is now handled in _request

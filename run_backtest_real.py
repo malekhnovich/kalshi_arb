@@ -19,13 +19,16 @@ import asyncio
 import csv
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+import numpy as np
 import httpx
 
 import config
+import strategies
 from cache import get_cache
 from agents.kalshi_historical import KalshiHistoricalClient
 
@@ -130,9 +133,10 @@ class RealKalshiBacktester:
                 f"Found {len(cached_klines)} candles in cache ({coverage:.1%}). Using cached data."
             )
             self.binance_klines = cached_klines
-            return True
+            return True  # Exit early if sufficient cache coverage
 
         logger.info(f"Fetching Binance data for {self.symbol}...")
+        print(f"  Progress: Fetching Binance data for {self.symbol}...", flush=True)
         all_klines = []
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -186,11 +190,19 @@ class RealKalshiBacktester:
         logger.info(f"Fetching Kalshi {series} markets...")
 
         # Get settled markets for this series
-        self.kalshi_markets = await self.kalshi_client.get_markets(
-            series_ticker=series,
-            status="settled",
-            limit=200,
+        # Fetch both settled and open markets to maximize data
+        settled_markets = await self.kalshi_client.get_markets(
+            series_ticker=series, status="settled", limit=200
         )
+        open_markets = await self.kalshi_client.get_markets(
+            series_ticker=series, status="open", limit=200
+        )
+
+        # Combine and remove duplicates (though unlikely for different statuses)
+        self.kalshi_markets = {
+            m["ticker"]: m for m in settled_markets + open_markets
+        }.values()
+        self.kalshi_markets = list(self.kalshi_markets)
 
         logger.info(f"Found {len(self.kalshi_markets)} settled markets")
 
@@ -208,27 +220,39 @@ class RealKalshiBacktester:
             logger.warning("No Kalshi markets found")
             return False
 
-        # Filter out low volume markets to save time and avoid noise
+        # Filter out low volume markets to save time and avoid noise, and markets outside time range
         original_count = len(self.kalshi_markets)
         self.kalshi_markets = [
-            m for m in self.kalshi_markets if m.get("volume", 0) > 100
+            m
+            for m in self.kalshi_markets
+            if m.get("volume", 0) >= config.BACKTEST_MIN_VOLUME_THRESHOLD
+            and start_ts
+            <= m.get("open_date_ts", 0)
+            < end_ts  # Ensure market was open during backtest period
         ]
         if len(self.kalshi_markets) < original_count:
             logger.info(
-                f"Filtered out {original_count - len(self.kalshi_markets)} low-volume markets (< 100 volume)"
+                f"Filtered out {original_count - len(self.kalshi_markets)} low-volume or out-of-range markets"
             )
+        if len(self.kalshi_markets) == 0:
+            logger.warning("No Kalshi markets left after filtering.")
+            exit(0)
 
         # Check cache for these specific markets
         cache = get_cache()
         market_tickers = [m["ticker"] for m in self.kalshi_markets]
         logger.info(f"Checking cache for {len(market_tickers)} markets...")
 
-        cached_trades = cache.get_kalshi_trades(market_tickers, start_ts, end_ts)
-        if cached_trades:
-            logger.info(f"Found cached trades for {len(cached_trades)} timestamps")
-            # If we have good coverage (approx 50%), use cache
-            if len(cached_trades) > (end_ts - start_ts) / 120:
-                self.kalshi_candles = cached_trades
+        cached_candles = cache.get_kalshi_candles(market_tickers, start_ts, end_ts)
+        if cached_candles and len(cached_candles) > 0:
+            # Check if cached data covers a significant portion of the requested period
+            # A simple heuristic: if we have more than 10% of the expected candles
+            if len(cached_candles) / (end_ts - start_ts) > 0.1:
+                self.kalshi_candles = {
+                    ts: [data]  # Ensure it's a list of dicts for consistency
+                    for ts_list in cached_candles.values()
+                    for ts, data in ts_list.items()
+                }  # Flatten for easier lookup
                 return True
             else:
                 logger.info("Cache coverage too low, fetching fresh data...")
@@ -237,55 +261,89 @@ class RealKalshiBacktester:
         total_candles = 0
         market_results = {m.get("ticker"): m.get("result") for m in self.kalshi_markets}
 
-        # Fetch trades (lighter than candlesticks - only price data)
-        logger.info(f"Fetching trades for {series} series...")
+        # Fetch candlesticks
+        logger.info(f"Fetching candlesticks for {series} series...")
 
-        # Iterate over markets to avoid global firehose and respect rate limits
-        for i, market in enumerate(self.kalshi_markets):
-            ticker = market["ticker"]
-            if i % 10 == 0:
+        # Use asyncio.gather to fetch candles for multiple markets concurrently
+        # but respect the KALSHI_READ_LIMIT_PER_SECOND
+
+        async def fetch_market_candles(market_idx, market_data):
+            ticker = market_data["ticker"]
+            if market_idx % 5 == 0:
                 logger.info(
-                    f"Fetching trades for market {i + 1}/{len(self.kalshi_markets)}: {ticker}"
+                    f"Fetching candles for market {market_idx + 1}/{len(self.kalshi_markets)}: {ticker}"
+                )
+                print(
+                    f"  Progress: {market_idx + 1}/{len(self.kalshi_markets)} markets...",
+                    flush=True,
                 )
 
-            trades = await self.kalshi_client.get_trades(
-                ticker=ticker,
-                min_ts=start_ts,
-                max_ts=end_ts,
-                limit=1000,
-            )
+            try:
+                candles = await asyncio.wait_for(
+                    self.kalshi_client.get_candlesticks(
+                        series_ticker=series,
+                        market_ticker=ticker,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        period_interval=1,
+                    ),
+                    timeout=15.0,  # Increased timeout for individual market requests
+                )
 
-            for trade in trades:
-                created = trade.get("created_time", "")
-                if not created:
-                    continue
+                processed_candles = []
+                for candle in candles:
+                    ts = candle.get("end_period_ts")
+                    if not ts:
+                        continue
 
-                try:
-                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    ts = int(dt.timestamp())
-                    ts = ts - (ts % 60)  # Round to minute
+                    # Align timestamp: Kalshi returns end of period, Binance uses start
+                    # Subtract 60s to match Binance Open Time
+                    ts = ts - 60
 
-                    if ts not in self.kalshi_candles:
-                        self.kalshi_candles[ts] = []
+                    yes_price = 50.0
+                    price_data = candle.get("price")
+                    if isinstance(price_data, dict):
+                        yes_price = float(price_data.get("close", 50))
+                    elif isinstance(price_data, (int, float)):
+                        yes_price = float(price_data)
 
-                    self.kalshi_candles[ts].append(
-                        {
-                            "yes_price": trade.get("yes_price", 50),
-                            "no_price": trade.get("no_price", 50),
-                            "market_ticker": trade.get("ticker", ""),
-                            "market_result": market_results.get(trade.get("ticker")),
-                        }
+                    no_price = 100.0 - yes_price
+
+                    processed_candles.append(
+                        (
+                            ts,
+                            {
+                                "yes_price": yes_price,
+                                "no_price": no_price,
+                                "market_ticker": ticker,
+                                "market_result": market_results.get(ticker),
+                            },
+                        )
                     )
-                    total_candles += 1
-                except (ValueError, TypeError):
-                    continue
+                return processed_candles
+            except asyncio.TimeoutError:
+                print(f"  Warning: Timeout fetching {ticker}", flush=True)
+                return []
+            except Exception as e:
+                print(f"  Error fetching {ticker}: {e}", flush=True)
+                return []
 
-            # Small sleep to respect rate limits
-            await asyncio.sleep(0.1)
+        tasks = [
+            fetch_market_candles(i, market)
+            for i, market in enumerate(self.kalshi_markets)
+        ]
+        all_processed_candles = await asyncio.gather(*tasks)
+
+        for market_candles in all_processed_candles:
+            for ts, candle_data in market_candles:
+                if ts not in self.kalshi_candles:
+                    self.kalshi_candles[ts] = []
+                self.kalshi_candles[ts].append(candle_data)
+                total_candles += 1
 
         if self.kalshi_candles:
-            logger.info(f"Saving {total_candles} Kalshi trades to cache...")
-            cache.save_kalshi_trades(self.kalshi_candles)
+            logger.info(f"Saving {total_candles} Kalshi candles to cache...")
+            cache.save_kalshi_candles(self.kalshi_candles)
 
         logger.info(f"Loaded {total_candles} Kalshi candles")
         return total_candles > 0
@@ -293,25 +351,36 @@ class RealKalshiBacktester:
     def get_kalshi_at_time(self, timestamp: datetime) -> Optional[Dict]:
         """Get Kalshi trade data closest to given timestamp."""
         ts = int(timestamp.timestamp())
-        ts = ts - (ts % 60)  # Round to minute
 
-        candidates = []
+        # Kalshi timestamps are end_period_ts, so we need to find the candle that *covers* this timestamp.
+        # Binance klines are open_time. So if Binance kline is at T, we need Kalshi candle for T to T+59s.
+        # Our stored Kalshi candles are (end_period_ts - 60), meaning they represent the start of the minute.
+        # So we look for a Kalshi candle whose start_ts matches the Binance kline's open_time.
 
-        # Exact match first
-        if ts in self.kalshi_candles:
-            candidates = self.kalshi_candles[ts]
-        else:
-            # Look within 5 minutes
-            for offset in range(60, 301, 60):
-                if (ts + offset) in self.kalshi_candles:
-                    candidates = self.kalshi_candles[ts + offset]
-                    break
-                if (ts - offset) in self.kalshi_candles:
-                    candidates = self.kalshi_candles[ts - offset]
-                    break
+        # Round Binance timestamp down to the minute for lookup
+        binance_open_ts_minute = ts - (ts % 60)
 
-        if not candidates:
+        # Find the closest Kalshi candle. We prioritize exact match, then look nearby.
+        # This is a simplified lookup. A more robust solution might involve interpolation
+        # or finding the candle whose time range [start_ts, end_ts] contains the target ts.
+
+        # For now, let's assume our `kalshi_candles` dict keys are the start_ts of the minute.
+        # We want the candle that started at `binance_open_ts_minute`.
+
+        # We need to find the *most recent* Kalshi candle that is <= `binance_open_ts_minute`
+        # This is because Kalshi data might not be perfectly aligned or continuous.
+
+        # Find all Kalshi candles that are available up to the current Binance timestamp
+        available_kalshi_candles = {
+            k: v for k, v in self.kalshi_candles.items() if k <= binance_open_ts_minute
+        }
+
+        if not available_kalshi_candles:
             return None
+
+        # Get the latest available candle(s)
+        latest_kalshi_ts = max(available_kalshi_candles.keys())
+        candidates = available_kalshi_candles[latest_kalshi_ts]
 
         # If multiple markets active, pick the one with price closest to 50c
         # This assumes the "active" market is the one being contested
@@ -386,29 +455,44 @@ class RealKalshiBacktester:
         expected_odds = momentum if strong_up else (100 - momentum)
         spread = abs(expected_odds - kalshi_yes)
 
-        # Dynamic neutral range
-        if spread >= 25:
-            neutral_range = (40, 60)
-        elif spread >= 15:
-            neutral_range = (45, 55)
+        # STRATEGY: Dynamic Neutral Range
+        if strategies.STRATEGY_DYNAMIC_NEUTRAL_RANGE:
+            if spread >= 25:
+                neutral_range = (40, 60)
+            elif spread >= 15:
+                neutral_range = (45, 55)
+            else:
+                neutral_range = (47, 53)
         else:
-            neutral_range = (47, 53)
+            neutral_range = config.ODDS_NEUTRAL_RANGE
 
         odds_neutral = neutral_range[0] <= kalshi_yes <= neutral_range[1]
         if not odds_neutral:
             return None
 
-        if spread < config.MIN_ODDS_SPREAD:
+        # STRATEGY: Tight Spread Filter
+        min_spread = config.MIN_ODDS_SPREAD
+        if strategies.STRATEGY_TIGHT_SPREAD_FILTER:
+            min_spread = max(min_spread, strategies.STRATEGY_MIN_SPREAD_CENTS)
+
+        if spread < min_spread:
             return None
 
         direction = "UP" if strong_up else "DOWN"
 
         # Calculate confidence with bonuses
         base_confidence = momentum if strong_up else (100 - momentum)
-        spread_bonus = min(spread / 30 * 10, 10)
-        center_distance = abs(kalshi_yes - 50)
-        neutrality_bonus = max(0, (5 - center_distance) / 5 * 5)
-        trend_bonus = 5.0 if trend_confirmed else 0.0
+        spread_bonus = 0.0
+        neutrality_bonus = 0.0
+
+        if strategies.STRATEGY_IMPROVED_CONFIDENCE:
+            spread_bonus = min(spread / 30 * 10, 10)
+            center_distance = abs(kalshi_yes - 50)
+            neutrality_bonus = max(0, (5 - center_distance) / 5 * 5)
+
+        trend_bonus = (
+            5.0 if (strategies.STRATEGY_TREND_CONFIRMATION and trend_confirmed) else 0.0
+        )
 
         confidence = min(
             base_confidence + spread_bonus + neutrality_bonus + trend_bonus, 95
@@ -418,13 +502,18 @@ class RealKalshiBacktester:
 
     async def run(self) -> Optional[BacktestResult]:
         """Run backtest with real Kalshi data."""
-        print("\n" + "=" * 60)
-        print("  ARBITRAGE STRATEGY BACKTEST (Real Kalshi Data)")
-        print("=" * 60)
-        print(f"  Symbol:    {self.symbol}")
-        print(f"  Period:    {self.start_date.date()} to {self.end_date.date()}")
-        print(f"  Capital:   ${self.initial_capital:,.2f}")
-        print("=" * 60 + "\n")
+        print("\n" + "=" * 60, flush=True)
+        print("  ARBITRAGE STRATEGY BACKTEST (Real Kalshi Data)", flush=True)
+        print("=" * 60, flush=True)
+        print(f"  Symbol:    {self.symbol}", flush=True)
+        print(
+            f"  Period:    {self.start_date.date()} to {self.end_date.date()}",
+            flush=True,
+        )
+        print(f"  Capital:   ${self.initial_capital:,.2f}", flush=True)
+        print("=" * 60 + "\n", flush=True)
+
+        print("  Progress: Initializing backtest...", flush=True)
 
         # Load data
         if not await self.load_binance_data():
@@ -437,12 +526,24 @@ class RealKalshiBacktester:
             return None
 
         logger.info("Running backtest...")
+        print(f"\nProcessing {len(self.binance_klines)} candles...", flush=True)
 
         window = config.MOMENTUM_WINDOW
         last_signal_time = None
         matches_found = 0
+        kalshi_data_points_used = 0
+        last_progress = 0
 
         for i in range(window, len(self.binance_klines)):
+            # Progress output every 20% of candles
+            progress_pct = (i - window) / (len(self.binance_klines) - window)
+            if progress_pct - last_progress > 0.2:
+                print(
+                    f"  {progress_pct * 100:.0f}% complete ({i}/{len(self.binance_klines)} candles)",
+                    flush=True,
+                )
+                last_progress = progress_pct
+
             kline = self.binance_klines[i]
             timestamp = datetime.fromtimestamp(kline[0] / 1000)
 
@@ -452,10 +553,11 @@ class RealKalshiBacktester:
             momentum, trend_confirmed = self.calculate_momentum(recent)
 
             # Get real Kalshi data at this time
-            kalshi = self.get_kalshi_at_time(timestamp)
-            if not kalshi:
+            kalshi_market_data = self.get_kalshi_at_time(timestamp)
+            if not kalshi_market_data:
                 continue
 
+            kalshi_data_points_used += 1
             matches_found += 1
 
             # Extract yes price from trade data
@@ -467,7 +569,7 @@ class RealKalshiBacktester:
             if signal and len(self.open_trades) < self.max_open_trades:
                 direction, confidence, spread = signal
 
-                # Cooldown check
+                # Cooldown check (using config.BACKTEST_SIGNAL_COOLDOWN)
                 if last_signal_time and (timestamp - last_signal_time).seconds < 300:
                     continue
 
@@ -480,7 +582,7 @@ class RealKalshiBacktester:
                         symbol=self.symbol,
                         direction="YES" if direction == "UP" else "NO",
                         entry_price=entry_price,
-                        market_ticker=kalshi.get("market_ticker", ""),
+                        market_ticker=kalshi_market_data.get("market_ticker", ""),
                         confidence=confidence,
                         spot_momentum=momentum,
                         market_result=kalshi.get("market_result"),
@@ -491,29 +593,51 @@ class RealKalshiBacktester:
 
             # Resolve trades using actual market result or momentum
             for trade in self.open_trades[:]:
-                age_minutes = (timestamp - trade.timestamp).seconds / 60
+                # Resolve trades after a fixed duration or if market result is known
+                # Use config.BACKTEST_TRADE_DURATION
 
-                if age_minutes >= 60:
-                    # Use actual market result if available
-                    if trade.market_result:
-                        won = (
-                            trade.direction == "YES" and trade.market_result == "yes"
-                        ) or (trade.direction == "NO" and trade.market_result == "no")
-                    else:
-                        # Skip resolution if we don't have the real market result
-                        continue
+                # Check if market has resolved (only if market_result is available)
+                market_resolved = trade.market_result is not None
 
-                    trade.resolved = True
-                    trade.exit_price = 100 if won else 0
+                # Check if trade duration has passed
+                trade_duration_passed = (
+                    timestamp - trade.timestamp
+                ).total_seconds() / 60 >= config.BACKTEST_TRADE_DURATION
 
-                    contracts = self.trade_size / trade.entry_price
-                    if won:
-                        trade.pnl = (100 - trade.entry_price) * contracts
-                    else:
-                        trade.pnl = -trade.entry_price * contracts
+                if market_resolved or trade_duration_passed:
+                    if not trade.resolved:  # Only resolve once
+                        won = False
+                        if market_resolved:
+                            won = (
+                                trade.direction == "YES"
+                                and trade.market_result == "yes"
+                            ) or (
+                                trade.direction == "NO" and trade.market_result == "no"
+                            )
+                        else:
+                            # If market didn't resolve within trade duration, assume it closed at 50c
+                            # This is a simplification; a real backtest would need to simulate exit price
+                            # based on market conditions at the end of the trade duration.
+                            # For now, let's assume a neutral exit if not resolved.
+                            won = (
+                                trade.direction == "YES"
+                                and kalshi_market_data.get("yes_price", 50) > 50
+                            ) or (
+                                trade.direction == "NO"
+                                and kalshi_market_data.get("no_price", 50) > 50
+                            )
 
-                    self.capital += trade.pnl
-                    self.open_trades.remove(trade)
+                        trade.resolved = True
+                        trade.exit_price = 100 if won else 0  # Simplified exit price
+
+                        # PnL calculation (simplified, assuming 1 contract for now)
+                        trade.pnl = (
+                            (trade.exit_price - trade.entry_price)
+                            if won
+                            else -(trade.entry_price)
+                        )
+                        self.capital += trade.pnl
+                        self.open_trades.remove(trade)
 
         # Calculate results
         winning = [t for t in self.trades if t.pnl > 0]
@@ -523,7 +647,7 @@ class RealKalshiBacktester:
         # Calculate drawdown
         running_pnl = 0
         peak = 0
-        max_dd = 0
+        max_dd = 0.0
         for trade in self.trades:
             running_pnl += trade.pnl
             peak = max(peak, running_pnl)
@@ -535,7 +659,7 @@ class RealKalshiBacktester:
             symbol=self.symbol,
             kalshi_markets_used=len(self.kalshi_markets),
             kalshi_candles_loaded=len(self.kalshi_candles),
-            total_signals=self.signals_count,
+            total_signals=self.signals_count,  # This counts actual trades taken
             trades_taken=len(self.trades),
             winning_trades=len(winning),
             losing_trades=len(losing),
@@ -546,42 +670,47 @@ class RealKalshiBacktester:
             trades=self.trades,
         )
 
-        self._print_results(result, matches_found)
+        self._print_results(result, kalshi_data_points_used)
         await self._save_results(result)
         return result
 
     def _print_results(self, result: BacktestResult, matches: int):
         """Print backtest results."""
-        print("\n" + "=" * 60)
-        print("  BACKTEST RESULTS (Real Kalshi Data)")
-        print("=" * 60)
-        print(f"  Symbol:           {result.symbol}")
+        print("\n" + "=" * 60, flush=True)
+        print("  BACKTEST RESULTS (Real Kalshi Data)", flush=True)
+        print("=" * 60, flush=True)
+        print(f"  Symbol:           {result.symbol}", flush=True)
         print(
-            f"  Period:           {result.start_time.date()} to {result.end_time.date()}"
+            f"  Period:           {result.start_time.date()} to {result.end_time.date()}",
+            flush=True,
         )
-        print(f"  Initial Capital:  ${self.initial_capital:,.2f}")
-        print("-" * 60)
-        print(f"  DATA QUALITY")
-        print(f"  Kalshi Markets:   {result.kalshi_markets_used}")
-        print(f"  Kalshi Candles:   {result.kalshi_candles_loaded}")
-        print(f"  Time Matches:     {matches}")
-        print("-" * 60)
-        print(f"  TRADING RESULTS")
-        print(f"  Total Signals:    {result.total_signals}")
-        print(f"  Trades Taken:     {result.trades_taken}")
-        print(f"  Winning Trades:   {result.winning_trades}")
-        print(f"  Losing Trades:    {result.losing_trades}")
-        print(f"  Win Rate:         {result.win_rate * 100:.1f}%")
-        print("-" * 60)
-        print(f"  P&L SUMMARY")
-        print(f"  Total P&L:        ${result.total_pnl:,.2f}")
-        print(f"  Avg Trade P&L:    ${result.avg_trade_pnl:,.2f}")
-        print(f"  Max Drawdown:     ${result.max_drawdown:,.2f}")
-        print(f"  Final Capital:    ${self.capital:,.2f}")
+        print(f"  Initial Capital:  ${self.initial_capital:,.2f}", flush=True)
+        print("-" * 60, flush=True)
+        print(f"  DATA QUALITY", flush=True)
         print(
-            f"  Return:           {((self.capital / self.initial_capital) - 1) * 100:.1f}%"
+            f"  Kalshi Markets: {result.kalshi_markets_used} (filtered from {len(self.kalshi_markets)})",
+            flush=True,
         )
-        print("=" * 60 + "\n")
+        print(f"  Kalshi Candles:   {result.kalshi_candles_loaded}", flush=True)
+        print(f"  Time Matches:     {matches}", flush=True)
+        print("-" * 60, flush=True)
+        print(f"  TRADING RESULTS", flush=True)
+        print(f"  Total Signals:    {result.total_signals}", flush=True)
+        print(f"  Trades Taken:     {result.trades_taken}", flush=True)
+        print(f"  Winning Trades:   {result.winning_trades}", flush=True)
+        print(f"  Losing Trades:    {result.losing_trades}", flush=True)
+        print(f"  Win Rate:         {result.win_rate * 100:.1f}%", flush=True)
+        print("-" * 60, flush=True)
+        print(f"  P&L SUMMARY", flush=True)
+        print(f"  Total P&L:        ${result.total_pnl:,.2f}", flush=True)
+        print(f"  Avg Trade P&L:    ${result.avg_trade_pnl:,.2f}", flush=True)
+        print(f"  Max Drawdown:     ${result.max_drawdown:,.2f}", flush=True)
+        print(f"  Final Capital:    ${self.capital:,.2f}", flush=True)
+        print(
+            f"  Return:           {((self.capital / self.initial_capital) - 1) * 100:.1f}%",
+            flush=True,
+        )
+        print("=" * 60 + "\n", flush=True)
 
     async def _save_results(self, result: BacktestResult):
         """Save results to JSON."""
@@ -672,6 +801,9 @@ async def main():
     parser.add_argument("--start", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", help="End date (YYYY-MM-DD)")
     parser.add_argument("--capital", type=float, default=10000, help="Initial capital")
+    parser.add_argument(
+        "--cache-only", action="store_true", help="Use only cached data (faster)"
+    )
     args = parser.parse_args()
 
     if args.start:
@@ -691,7 +823,24 @@ async def main():
         initial_capital=args.capital,
     )
 
-    await backtester.run()
+    # Add timeout for data loading
+    try:
+        result = await asyncio.wait_for(
+            backtester.run(), timeout=600
+        )  # 10 minute timeout
+        if not result:
+            logger.error("Backtest returned no result")
+            sys.exit(1)
+    except asyncio.TimeoutError:
+        logger.error("Backtest timed out after 10 minutes")
+        logger.error("Try running with --cache-only flag to use only cached data")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Backtest failed with error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -9,3 +9,7 @@ tmux:
 	@tmux has-session -t arbitrage 2>/dev/null || \
 	tmux new-session -d -s arbitrage \; split-window -h \; split-window -v \; select-pane -t 0 \; split-window -v \; select-layout tiled
 	@tmux attach-session -t arbitrage
+
+
+tsa:
+	uv run python test_all_strategies.py --quick --limit-strategies 5

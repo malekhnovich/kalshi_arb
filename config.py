@@ -154,7 +154,7 @@ def get_live_trading_status() -> dict:
 
 # Analysis Configuration
 # Env: MOMENTUM_WINDOW
-MOMENTUM_WINDOW = _get_env_int("MOMENTUM_WINDOW", 60)  # minutes to analyze for momentum
+MOMENTUM_WINDOW = _get_env_int("MOMENTUM_WINDOW", 20)  # minutes to analyze for momentum
 # Env: CONFIDENCE_THRESHOLD
 CONFIDENCE_THRESHOLD = _get_env_int("CONFIDENCE_THRESHOLD", 70)  # percent confidence
 
