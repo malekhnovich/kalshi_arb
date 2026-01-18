@@ -40,3 +40,4 @@ backtest_*.json
 private_key.pem
 
 nohup.out
+PARAM*
