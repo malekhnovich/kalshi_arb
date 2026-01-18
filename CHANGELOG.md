@@ -2,6 +2,106 @@
 
 All notable changes to the arbitrage detection system.
 
+## [1.9.0] - 2026-01-17
+
+### Code Review & Critical Bug Fixes + Signal Visibility
+
+Comprehensive code review identified and fixed critical missing implementation. Added signal generation and reception logging for full visibility into trade flow.
+
+#### Bug Fixes
+
+**CRITICAL: Market-Specific Momentum Thresholds Not Implemented**
+- **Issue**: Helper functions `get_momentum_threshold_for_market()`, `get_momentum_window_for_market()`, and `is_15min_market()` were defined in `strategies.py` but never called in actual trading logic
+- **Impact**: All markets (hourly and 15-min) were using hardcoded 70% momentum threshold instead of market-specific thresholds (70% for hourly, 65% for 15-min)
+- **Files Fixed**:
+  - `agents/arbitrage_detector.py` (lines 146-152): Now calls `strategies.get_momentum_threshold_for_market()` instead of using hardcoded `self.confidence_threshold`
+  - `run_backtest_real.py` (lines 604-733): Added `market_ticker` parameter to `check_signal()` method and implemented market-specific threshold lookup
+
+**Result**:
+- Hourly markets now correctly use 70% momentum threshold
+- 15-min markets now correctly use 65% momentum threshold
+- Backtesting now matches live trading logic exactly
+- 15-min market support is now fully functional
+
+#### New Features
+
+**1. Signal Generation Logging**
+- **File**: `agents/arbitrage_detector.py` (lines 290-295)
+- Added `🎯 SIGNAL GENERATED` flag when arbitrage detector creates a signal
+- Shows: symbol, direction, confidence, momentum, spread
+- Example: `[ArbitrageDetector] 🎯 SIGNAL GENERATED: BTCUSDT UP (Confidence: 72.5%, Momentum: 75.2%, Spread: 8.5c)`
+
+**2. Signal Reception Logging**
+- **File**: `agents/trader.py` (lines 660-665)
+- Added `📊 SIGNAL RECEIVED` flag when trader receives a signal
+- Shows: symbol, direction, confidence, spread, kalshi odds
+- Example: `[Trader] 📊 SIGNAL RECEIVED: BTCUSDT UP (Confidence: 72.5%, Spread: 8.5c, Kalshi: 45c)`
+
+**3. Full Signal Flow Visibility**
+Signal flow is now completely visible:
+```
+🎯 SIGNAL GENERATED → 📊 SIGNAL RECEIVED → 🟢 TRADE ENTERED / ⏭️ SKIPPED
+```
+
+#### Complete Trade Flow Example
+
+When a trade executes:
+```
+[ArbitrageDetector] 🎯 SIGNAL GENERATED: BTCUSDT UP
+(Confidence: 72.5%, Momentum: 75.2%, Spread: 8.5c)
+
+[Trader] 📊 SIGNAL RECEIVED: BTCUSDT UP
+(Confidence: 72.5%, Spread: 8.5c, Kalshi: 45c)
+
+🟢 [Trader] [DRY-RUN] TRADE ENTERED
+  Order ID: order_12345
+  Market: KXBTC-26JAN1722-B95125
+  Side: YES
+  Quantity: 5 contracts
+  Entry Price: 45c
+  Expected P&L: $27.50
+```
+
+When a signal is rejected:
+```
+[ArbitrageDetector] 🎯 SIGNAL GENERATED: ETHUSDT DOWN
+(Confidence: 68.0%, Momentum: 28.5%, Spread: 4.5c)
+
+[Trader] 📊 SIGNAL RECEIVED: ETHUSDT DOWN
+(Confidence: 68.0%, Spread: 4.5c, Kalshi: 52c)
+
+[Trader] ⏭️  Skipping signal: Edge 4.5c < 10.0c
+```
+
+#### Code Quality Improvements
+
+**Verification Checklist**:
+- ✅ Market-specific thresholds implemented in 2 files
+- ✅ All Python files compile without errors
+- ✅ Market detection functions work correctly (tested)
+- ✅ 15-min market threshold selection works (65% vs 70%)
+- ✅ Signal flow fully visible with emoji flags
+- ✅ All 10 strategies still working correctly
+- ✅ Risk management limits still enforced
+- ✅ All configuration parameters still being used
+
+#### Files Modified
+
+| File | Changes |
+|------|---------|
+| `agents/arbitrage_detector.py` | Fixed market-specific threshold usage (lines 146-152); added signal generation logging (lines 290-295) |
+| `agents/trader.py` | Added signal reception logging (lines 660-665) |
+| `run_backtest_real.py` | Added `market_ticker` parameter to `check_signal()` (line 609); implemented market-specific threshold (line 613); pass market_ticker when calling (line 733) |
+
+#### Impact
+
+- ✅ **Live Trading**: Now properly differentiates between 15-min and hourly markets
+- ✅ **Backtesting**: Results now match live trading behavior exactly
+- ✅ **Monitoring**: Full visibility into when signals are generated and accepted/rejected
+- ✅ **Debugging**: Easy to trace signal flow through the system
+
+---
+
 ## [1.8.0] - 2026-01-17
 
 ### Statistical Significance Testing & Strategy Analysis
