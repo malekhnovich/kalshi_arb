@@ -222,13 +222,24 @@ class RealKalshiBacktester:
 
         # Filter out low volume markets to save time and avoid noise, and markets outside time range
         original_count = len(self.kalshi_markets)
+
+        def get_market_open_ts(market: Dict) -> int:
+            """Parse market open_time ISO string to unix timestamp in seconds."""
+            open_time = market.get("open_time")
+            if not open_time:
+                return 0
+            try:
+                # Handle ISO format like "2023-11-07T05:31:56Z"
+                dt = datetime.fromisoformat(open_time.replace("Z", "+00:00"))
+                return int(dt.timestamp())
+            except (ValueError, AttributeError):
+                return 0
+
         self.kalshi_markets = [
             m
             for m in self.kalshi_markets
             if m.get("volume", 0) >= config.BACKTEST_MIN_VOLUME_THRESHOLD
-            and start_ts
-            <= m.get("open_date_ts", 0)
-            < end_ts  # Ensure market was open during backtest period
+            and start_ts <= get_market_open_ts(m) < end_ts
         ]
         if len(self.kalshi_markets) < original_count:
             logger.info(
@@ -279,19 +290,59 @@ class RealKalshiBacktester:
                 )
 
             try:
-                candles = await asyncio.wait_for(
-                    self.kalshi_client.get_candlesticks(
-                        series_ticker=series,
-                        market_ticker=ticker,
-                        start_ts=start_ts,
-                        end_ts=end_ts,
-                        period_interval=1,
-                    ),
-                    timeout=15.0,  # Increased timeout for individual market requests
-                )
+                # Use the market's actual open/close time, not full backtest range
+                # Markets typically only exist for 1 hour
+                market_open = market_data.get("open_time")
+                market_close = market_data.get("close_time")
+
+                if market_open and market_close:
+                    try:
+                        market_start = int(
+                            datetime.fromisoformat(
+                                market_open.replace("Z", "+00:00")
+                            ).timestamp()
+                        )
+                        market_end = int(
+                            datetime.fromisoformat(
+                                market_close.replace("Z", "+00:00")
+                            ).timestamp()
+                        )
+                        # Clamp to our backtest period
+                        req_start = max(start_ts, market_start)
+                        req_end = min(end_ts, market_end)
+                    except (ValueError, AttributeError):
+                        req_start, req_end = start_ts, end_ts
+                else:
+                    req_start, req_end = start_ts, end_ts
+
+                # Skip if market time range doesn't overlap with backtest period
+                if req_start >= req_end:
+                    return []
+
+                # Chunk requests to stay under 5000 candle limit if needed
+                # 3 days of 1-min candles = 4320 < 5000
+                chunk_seconds = 3 * 24 * 60 * 60  # 3 days in seconds
+                all_candles = []
+                chunk_start = req_start
+
+                while chunk_start < req_end:
+                    chunk_end = min(chunk_start + chunk_seconds, req_end)
+
+                    candles = await asyncio.wait_for(
+                        self.kalshi_client.get_candlesticks(
+                            series_ticker=series,
+                            market_ticker=ticker,
+                            start_ts=chunk_start,
+                            end_ts=chunk_end,
+                            period_interval=1,
+                        ),
+                        timeout=15.0,
+                    )
+                    all_candles.extend(candles)
+                    chunk_start = chunk_end
 
                 processed_candles = []
-                for candle in candles:
+                for candle in all_candles:
                     ts = candle.get("end_period_ts")
                     if not ts:
                         continue
@@ -300,12 +351,25 @@ class RealKalshiBacktester:
                     # Subtract 60s to match Binance Open Time
                     ts = ts - 60
 
+                    # Extract yes_price from candle data
+                    # Priority: yes_bid.close (what you'd pay), then price.close, then default
                     yes_price = 50.0
+                    yes_bid = candle.get("yes_bid")
+                    yes_ask = candle.get("yes_ask")
                     price_data = candle.get("price")
-                    if isinstance(price_data, dict):
-                        yes_price = float(price_data.get("close", 50))
-                    elif isinstance(price_data, (int, float)):
-                        yes_price = float(price_data)
+
+                    if yes_bid and isinstance(yes_bid, dict):
+                        bid_close = yes_bid.get("close")
+                        if bid_close is not None:
+                            yes_price = float(bid_close)
+                    elif yes_ask and isinstance(yes_ask, dict):
+                        ask_close = yes_ask.get("close")
+                        if ask_close is not None:
+                            yes_price = float(ask_close)
+                    elif price_data and isinstance(price_data, dict):
+                        price_close = price_data.get("close")
+                        if price_close is not None:
+                            yes_price = float(price_close)
 
                     no_price = 100.0 - yes_price
 
@@ -439,6 +503,104 @@ class RealKalshiBacktester:
 
         return momentum, trend_confirmed
 
+    def calculate_volatility(self, klines: List[List]) -> float:
+        """Calculate volatility as standard deviation of returns."""
+        if len(klines) < 2:
+            return 0.0
+
+        returns = []
+        for i in range(1, len(klines)):
+            prev_close = float(klines[i - 1][4])
+            curr_close = float(klines[i][4])
+            if prev_close > 0:
+                returns.append((curr_close - prev_close) / prev_close)
+
+        if not returns:
+            return 0.0
+
+        return float(np.std(returns))
+
+    def calculate_momentum_acceleration(
+        self, klines: List[List], window: int = 10
+    ) -> tuple[float, float, bool]:
+        """
+        Calculate momentum and whether it's accelerating.
+        Returns (current_momentum, previous_momentum, is_accelerating).
+        """
+        if len(klines) < window * 2:
+            return 50.0, 50.0, True  # Default to no filtering
+
+        # Recent window momentum
+        recent = klines[-window:]
+        recent_momentum, _ = self.calculate_momentum(recent)
+
+        # Previous window momentum
+        previous = klines[-window * 2 : -window]
+        prev_momentum, _ = self.calculate_momentum(previous)
+
+        # Accelerating if momentum is moving further from 50 in the same direction
+        if recent_momentum >= 50:
+            is_accelerating = recent_momentum >= prev_momentum
+        else:
+            is_accelerating = recent_momentum <= prev_momentum
+
+        return recent_momentum, prev_momentum, is_accelerating
+
+    def check_pullback(
+        self, klines: List[List], direction: str, threshold: float = 0.3
+    ) -> bool:
+        """
+        Check if price has pulled back from recent extreme.
+        For UP signals: price should have pulled back from recent high.
+        For DOWN signals: price should have pulled back from recent low.
+        """
+        if len(klines) < 10:
+            return True  # Not enough data, allow trade
+
+        recent_prices = [float(k[4]) for k in klines[-10:]]
+        current_price = recent_prices[-1]
+
+        if direction == "UP":
+            recent_high = max(recent_prices[:-1])  # Exclude current
+            if recent_high > 0:
+                pullback_pct = (recent_high - current_price) / recent_high * 100
+                return pullback_pct >= threshold
+        else:
+            recent_low = min(recent_prices[:-1])  # Exclude current
+            if recent_low > 0:
+                pullback_pct = (current_price - recent_low) / recent_low * 100
+                return pullback_pct >= threshold
+
+        return True
+
+    def calculate_multiframe_momentum(self, klines: List[List], period: int = 5) -> float:
+        """
+        Calculate momentum on aggregated candles (e.g., 5-min from 1-min data).
+        """
+        if len(klines) < period * 4:  # Need at least 4 aggregated candles
+            return 50.0
+
+        # Aggregate 1-min candles into larger period candles
+        aggregated = []
+        for i in range(0, len(klines) - period + 1, period):
+            chunk = klines[i : i + period]
+            if len(chunk) == period:
+                agg_candle = [
+                    chunk[0][0],  # Open time
+                    chunk[0][1],  # Open price
+                    max(float(k[2]) for k in chunk),  # High
+                    min(float(k[3]) for k in chunk),  # Low
+                    chunk[-1][4],  # Close price
+                    sum(float(k[5]) for k in chunk),  # Volume
+                ]
+                aggregated.append(agg_candle)
+
+        if len(aggregated) < 4:
+            return 50.0
+
+        momentum, _ = self.calculate_momentum(aggregated[-20:])
+        return momentum
+
     def check_signal(
         self,
         momentum: float,
@@ -561,7 +723,7 @@ class RealKalshiBacktester:
             matches_found += 1
 
             # Extract yes price from trade data
-            yes_price = kalshi.get("yes_price", 50)
+            yes_price = kalshi_market_data.get("yes_price", 50)
 
             # Check for signal
             signal = self.check_signal(momentum, trend_confirmed, yes_price)
@@ -572,6 +734,64 @@ class RealKalshiBacktester:
                 # Cooldown check (using config.BACKTEST_SIGNAL_COOLDOWN)
                 if last_signal_time and (timestamp - last_signal_time).seconds < 300:
                     continue
+
+                # STRATEGY: Time Filter - only trade during active hours
+                if strategies.STRATEGY_TIME_FILTER:
+                    hour_utc = timestamp.hour
+                    start_hour = strategies.STRATEGY_TRADING_HOURS_START
+                    end_hour = strategies.STRATEGY_TRADING_HOURS_END
+                    if start_hour <= end_hour:
+                        in_trading_hours = start_hour <= hour_utc < end_hour
+                    else:  # Handles overnight range (e.g., 22 to 6)
+                        in_trading_hours = hour_utc >= start_hour or hour_utc < end_hour
+                    if not in_trading_hours:
+                        continue
+
+                # STRATEGY: Volatility Filter - skip high volatility periods
+                if strategies.STRATEGY_VOLATILITY_FILTER:
+                    volatility = self.calculate_volatility(recent)
+                    if volatility > strategies.STRATEGY_VOLATILITY_THRESHOLD:
+                        continue
+
+                # STRATEGY: Momentum Acceleration - skip if momentum is decelerating
+                if strategies.STRATEGY_MOMENTUM_ACCELERATION:
+                    _, _, is_accelerating = self.calculate_momentum_acceleration(
+                        self.binance_klines[max(0, i - window * 2) : i]
+                    )
+                    if not is_accelerating:
+                        continue
+
+                # STRATEGY: Pullback Entry - wait for pullback before entering
+                if strategies.STRATEGY_PULLBACK_ENTRY:
+                    has_pullback = self.check_pullback(
+                        recent, direction, strategies.STRATEGY_PULLBACK_THRESHOLD
+                    )
+                    if not has_pullback:
+                        continue
+
+                # STRATEGY: Correlation Check - skip if already holding same symbol
+                if strategies.STRATEGY_CORRELATION_CHECK:
+                    already_holding = any(
+                        t.symbol == self.symbol and not t.resolved
+                        for t in self.open_trades
+                    )
+                    if already_holding:
+                        continue
+
+                # STRATEGY: Multiframe Confirmation - confirm on 5-min timeframe
+                if strategies.STRATEGY_MULTIFRAME_CONFIRMATION:
+                    # Need enough data for 5-min aggregation
+                    lookback = min(i, 100)  # Look back up to 100 1-min candles
+                    multiframe_data = self.binance_klines[i - lookback : i]
+                    multiframe_momentum = self.calculate_multiframe_momentum(
+                        multiframe_data, period=5
+                    )
+                    # Check if 5-min momentum agrees with direction
+                    threshold = strategies.STRATEGY_MULTIFRAME_MOMENTUM_THRESHOLD
+                    if direction == "UP" and multiframe_momentum < threshold:
+                        continue
+                    if direction == "DOWN" and multiframe_momentum > (100 - threshold):
+                        continue
 
                 if confidence >= self.min_confidence:
                     self.signals_count += 1
@@ -585,7 +805,7 @@ class RealKalshiBacktester:
                         market_ticker=kalshi_market_data.get("market_ticker", ""),
                         confidence=confidence,
                         spot_momentum=momentum,
-                        market_result=kalshi.get("market_result"),
+                        market_result=kalshi_market_data.get("market_result"),
                     )
                     self.open_trades.append(trade)
                     self.trades.append(trade)

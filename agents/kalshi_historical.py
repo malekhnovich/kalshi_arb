@@ -10,8 +10,7 @@ import asyncio
 import base64
 import logging
 import time
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -153,7 +152,7 @@ class KalshiHistoricalClient:
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code == 429:
-                    if retry_count >= 3:
+                    if retry_count >= 10:
                         logger.error(f"Rate limit hit max retries for {endpoint}")
                         return None
 
@@ -201,6 +200,8 @@ class KalshiHistoricalClient:
             "end_ts": end_ts,
             "period_interval": period_interval,
         }
+        logger.info(
+            f"Fetching candlesticks for {datetime.fromtimestamp(start_ts)} to {datetime.fromtimestamp(end_ts)}")
 
         data = await self._request("GET", endpoint, params)
         if data:
@@ -291,7 +292,7 @@ class KalshiHistoricalClient:
         status: str = "settled",
         limit: int = 100,
         max_close_ts: int = int(
-            (datetime.today() - timedelta(days=1)).timestamp() * 1000
+            (datetime.today() + timedelta(days=1)).timestamp() * 1000
         ),
         min_close_ts: int = int(
             (datetime.today() - timedelta(days=7)).timestamp() * 1000
