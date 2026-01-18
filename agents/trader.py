@@ -657,12 +657,19 @@ class TraderAgent(BaseAgent):
 
         self.stats.signals_received += 1
 
+        # Log signal receipt with key details
+        print(
+            f"\n[{self.name}] 📊 SIGNAL RECEIVED: {event.symbol} {event.direction} "
+            f"(Confidence: {event.confidence}%, Spread: {event.spread}c, "
+            f"Kalshi: {event.kalshi_yes_price}c)"
+        )
+
         # Check if we should trade this signal
         should_trade, reason = self._should_trade(event)
 
         if not should_trade:
             self.stats.signals_skipped += 1
-            print(f"[{self.name}] Skipping signal: {reason}")
+            print(f"[{self.name}] ⏭️  Skipping signal: {reason}")
             return
 
         # Execute the trade
@@ -700,6 +707,33 @@ class TraderAgent(BaseAgent):
 
     async def _execute_trade(self, signal: ArbitrageSignalEvent) -> None:
         """Execute a trade based on the signal"""
+
+        # CHECK: Daily loss limit
+        if self.stats.realized_pnl <= -config.MAX_DAILY_LOSS:
+            print(f"\n{'='*60}")
+            print(f"🛑 [{self.name}] DAILY LOSS LIMIT EXCEEDED")
+            print(f"{'='*60}")
+            print(f"  Daily Loss Limit: ${config.MAX_DAILY_LOSS}")
+            print(f"  Current P&L:      ${self.stats.realized_pnl:.2f}")
+            print(f"  Action: HALTING NEW TRADES")
+            print(f"  Existing positions will still close when markets settle")
+            print(f"{'='*60}")
+            self.stats.signals_skipped += 1
+            return
+
+        # CHECK: Max drawdown limit
+        if config.STAGE_1_MAX_DRAWDOWN_PERCENT > 0:
+            max_allowed_drawdown = config.STAGE_1_CAPITAL_BASE * (config.STAGE_1_MAX_DRAWDOWN_PERCENT / 100)
+            if self.stats.max_drawdown > max_allowed_drawdown:
+                print(f"\n{'='*60}")
+                print(f"🛑 [{self.name}] MAX DRAWDOWN LIMIT EXCEEDED")
+                print(f"{'='*60}")
+                print(f"  Max Drawdown Allowed: ${max_allowed_drawdown:.2f}")
+                print(f"  Current Drawdown:     ${self.stats.max_drawdown:.2f}")
+                print(f"  Action: HALTING NEW TRADES")
+                print(f"{'='*60}")
+                self.stats.signals_skipped += 1
+                return
 
         # Determine side and price
         if signal.direction == "UP":
@@ -791,12 +825,16 @@ class TraderAgent(BaseAgent):
         partial_tag = " [PARTIAL FILL]" if is_partial else ""
 
         print(f"\n{'='*60}")
-        print(f"[{self.name}] {mode_tag}{realistic_tag} TRADE EXECUTED{partial_tag}")
+        print(f"🟢 [{self.name}] {mode_tag}{realistic_tag} TRADE ENTERED{partial_tag}")
         print(f"{'='*60}")
         print(f"  Order ID:     {position.id}")
         print(f"  Market:       {signal.market_ticker}")
         print(f"  Symbol:       {signal.symbol}")
         print(f"  Side:         {side.upper()}")
+        print(f"  Quantity:     {actual_filled_qty} contracts")
+        print(f"  Entry Price:  {actual_fill_price}c")
+        print(f"  Confidence:   {signal.confidence}%")
+        print(f"  Expected P&L: ${expected_pnl:.2f}")
         print(f"-" * 60)
         print(f"  EXECUTION DETAILS")
         print(f"  Requested:    {quantity} contracts @ {price}c")
@@ -916,7 +954,29 @@ class TraderAgent(BaseAgent):
 
         mode_tag = "[DRY-RUN]" if self.dry_run else "[LIVE]"
         pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        print(f"[{self.name}] {mode_tag} Position closed: {market_ticker} | P&L: {pnl_str} | Reason: {reason}")
+
+        # Add alert emoji based on win/loss
+        if pnl > 0:
+            emoji = "🎉"
+            result_text = "WIN"
+        elif pnl < 0:
+            emoji = "❌"
+            result_text = "LOSS"
+        else:
+            emoji = "⚪"
+            result_text = "BREAKEVEN"
+
+        print(f"\n{'='*60}")
+        print(f"{emoji} [{self.name}] {mode_tag} TRADE CLOSED - {result_text}")
+        print(f"{'='*60}")
+        print(f"  Market:       {market_ticker}")
+        print(f"  Entry Price:  {position.entry_price}c")
+        print(f"  Close Price:  {close_price}c")
+        print(f"  Contracts:    {position.quantity}")
+        print(f"  P&L:          {pnl_str}")
+        print(f"  Reason:       {reason}")
+        print(f"  Win Rate:     {self.stats.winning_trades}/{self.stats.total_trades}")
+        print(f"{'='*60}")
 
         return pnl
 

@@ -16,7 +16,6 @@ import numpy as np
 from typing import Dict, List, Tuple, Any
 from scipy import stats
 import json
-from pathlib import Path
 from dataclasses import dataclass
 
 
@@ -57,7 +56,8 @@ class StrategyStatistics:
 
         denominator = 1 + z**2 / n
         center = (successes + z**2 / 2) / n
-        adjustment = z * np.sqrt((successes * (1 - successes / n) + z**2 / 4) / n)
+        p_hat = successes / n
+        adjustment = z * np.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * n)) / n)
 
         lower = (center - adjustment) / denominator
         upper = (center + adjustment) / denominator
@@ -85,12 +85,13 @@ class StrategyStatistics:
             )
 
         # Binomial test
-        p_value = stats.binom_test(
+        result = stats.binomtest(
             self.num_wins,
             self.num_trades,
             null_hypothesis,
             alternative="two-sided"
         )
+        p_value = result.pvalue
 
         lower, upper = self.win_rate_ci()
         actual_wr = self.num_wins / self.num_trades
@@ -381,5 +382,5 @@ if __name__ == "__main__":
         {"pnl": 60}, {"pnl": -5}, {"pnl": 80}, {"pnl": 25},
     ]
 
-    stats = StrategyStatistics(sample_trades)
-    print(stats.generate_report())
+    strategy_stats = StrategyStatistics(sample_trades)
+    print(strategy_stats.generate_report())

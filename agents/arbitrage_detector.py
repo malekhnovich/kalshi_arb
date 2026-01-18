@@ -144,8 +144,12 @@ class ArbitrageDetectorAgent(BaseAgent):
                     is_accelerating = recent_avg <= older_avg + 2
 
         # Determine if spot shows strong direction
-        strong_up = momentum >= self.confidence_threshold
-        strong_down = momentum <= (100 - self.confidence_threshold)
+        # Use market-specific threshold (65% for 15-min, 70% for hourly)
+        market_threshold = strategies.get_momentum_threshold_for_market(
+            kalshi_event.market_ticker
+        )
+        strong_up = momentum >= market_threshold
+        strong_down = momentum <= (100 - market_threshold)
 
         # STRATEGY: Trend Confirmation
         trend_bonus = 0.0
@@ -178,6 +182,13 @@ class ArbitrageDetectorAgent(BaseAgent):
             distance_pct = abs(price_event.price - strike_price) / strike_price
             dist_check = distance_pct <= self.strike_distance_threshold
 
+        # STRATEGY: Apply all filters before generating signal
+        # Check additional strategy filters (MUST BE BEFORE debug logging below)
+        vol_passes, vol_reason = self._check_volatility_filter(symbol)
+        pullback_passes, pullback_reason = self._check_pullback_entry(symbol, price_event.price)
+        time_passes, time_reason = self._check_time_filter(event_time)
+        corr_passes, corr_reason = self._check_correlation(symbol)
+
         # Debug logging for skipped signals (only log if momentum is significant)
         if (strong_up or strong_down) and not (
             odds_neutral and is_accelerating and dist_check and vol_passes and pullback_passes and time_passes and corr_passes
@@ -204,13 +215,6 @@ class ArbitrageDetectorAgent(BaseAgent):
             print(
                 f"[{self.name}] Skipping {symbol}: Momentum={momentum:.1f}, Reasons={', '.join(reasons)}"
             )
-
-        # STRATEGY: Apply all filters before generating signal
-        # Check additional strategy filters
-        vol_passes, vol_reason = self._check_volatility_filter(symbol)
-        pullback_passes, pullback_reason = self._check_pullback_entry(symbol, price_event.price)
-        time_passes, time_reason = self._check_time_filter(event_time)
-        corr_passes, corr_reason = self._check_correlation(symbol)
 
         # Determine minimum spread based on strategy
         min_spread = self.min_odds_spread
@@ -281,6 +285,13 @@ class ArbitrageDetectorAgent(BaseAgent):
                     spread=round(spread, 1),
                     fair_probability=round(fair_prob, 1),
                     recommendation=recommendation,
+                )
+
+                # Log signal generation
+                print(
+                    f"\n[{self.name}] 🎯 SIGNAL GENERATED: {price_event.symbol} {direction} "
+                    f"(Confidence: {confidence:.1f}%, Momentum: {momentum:.1f}%, "
+                    f"Spread: {spread:.1f}c)"
                 )
 
                 await self.publish(signal)

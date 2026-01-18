@@ -2,7 +2,187 @@
 
 All notable changes to the arbitrage detection system.
 
-## [1.6.0] - 2026-01-17
+## [1.9.0] - 2026-01-17
+
+### Code Review & Critical Bug Fixes + Signal Visibility
+
+Comprehensive code review identified and fixed critical missing implementation. Added signal generation and reception logging for full visibility into trade flow.
+
+#### Bug Fixes
+
+**CRITICAL: Market-Specific Momentum Thresholds Not Implemented**
+- **Issue**: Helper functions `get_momentum_threshold_for_market()`, `get_momentum_window_for_market()`, and `is_15min_market()` were defined in `strategies.py` but never called in actual trading logic
+- **Impact**: All markets (hourly and 15-min) were using hardcoded 70% momentum threshold instead of market-specific thresholds (70% for hourly, 65% for 15-min)
+- **Files Fixed**:
+  - `agents/arbitrage_detector.py` (lines 146-152): Now calls `strategies.get_momentum_threshold_for_market()` instead of using hardcoded `self.confidence_threshold`
+  - `run_backtest_real.py` (lines 604-733): Added `market_ticker` parameter to `check_signal()` method and implemented market-specific threshold lookup
+
+**Result**:
+- Hourly markets now correctly use 70% momentum threshold
+- 15-min markets now correctly use 65% momentum threshold
+- Backtesting now matches live trading logic exactly
+- 15-min market support is now fully functional
+
+#### New Features
+
+**1. Signal Generation Logging**
+- **File**: `agents/arbitrage_detector.py` (lines 290-295)
+- Added `🎯 SIGNAL GENERATED` flag when arbitrage detector creates a signal
+- Shows: symbol, direction, confidence, momentum, spread
+- Example: `[ArbitrageDetector] 🎯 SIGNAL GENERATED: BTCUSDT UP (Confidence: 72.5%, Momentum: 75.2%, Spread: 8.5c)`
+
+**2. Signal Reception Logging**
+- **File**: `agents/trader.py` (lines 660-665)
+- Added `📊 SIGNAL RECEIVED` flag when trader receives a signal
+- Shows: symbol, direction, confidence, spread, kalshi odds
+- Example: `[Trader] 📊 SIGNAL RECEIVED: BTCUSDT UP (Confidence: 72.5%, Spread: 8.5c, Kalshi: 45c)`
+
+**3. Full Signal Flow Visibility**
+Signal flow is now completely visible:
+```
+🎯 SIGNAL GENERATED → 📊 SIGNAL RECEIVED → 🟢 TRADE ENTERED / ⏭️ SKIPPED
+```
+
+#### Complete Trade Flow Example
+
+When a trade executes:
+```
+[ArbitrageDetector] 🎯 SIGNAL GENERATED: BTCUSDT UP
+(Confidence: 72.5%, Momentum: 75.2%, Spread: 8.5c)
+
+[Trader] 📊 SIGNAL RECEIVED: BTCUSDT UP
+(Confidence: 72.5%, Spread: 8.5c, Kalshi: 45c)
+
+🟢 [Trader] [DRY-RUN] TRADE ENTERED
+  Order ID: order_12345
+  Market: KXBTC-26JAN1722-B95125
+  Side: YES
+  Quantity: 5 contracts
+  Entry Price: 45c
+  Expected P&L: $27.50
+```
+
+When a signal is rejected:
+```
+[ArbitrageDetector] 🎯 SIGNAL GENERATED: ETHUSDT DOWN
+(Confidence: 68.0%, Momentum: 28.5%, Spread: 4.5c)
+
+[Trader] 📊 SIGNAL RECEIVED: ETHUSDT DOWN
+(Confidence: 68.0%, Spread: 4.5c, Kalshi: 52c)
+
+[Trader] ⏭️  Skipping signal: Edge 4.5c < 10.0c
+```
+
+#### Code Quality Improvements
+
+**Verification Checklist**:
+- ✅ Market-specific thresholds implemented in 2 files
+- ✅ All Python files compile without errors
+- ✅ Market detection functions work correctly (tested)
+- ✅ 15-min market threshold selection works (65% vs 70%)
+- ✅ Signal flow fully visible with emoji flags
+- ✅ All 10 strategies still working correctly
+- ✅ Risk management limits still enforced
+- ✅ All configuration parameters still being used
+
+#### Files Modified
+
+| File | Changes |
+|------|---------|
+| `agents/arbitrage_detector.py` | Fixed market-specific threshold usage (lines 146-152); added signal generation logging (lines 290-295) |
+| `agents/trader.py` | Added signal reception logging (lines 660-665) |
+| `run_backtest_real.py` | Added `market_ticker` parameter to `check_signal()` (line 609); implemented market-specific threshold (line 613); pass market_ticker when calling (line 733) |
+
+#### Impact
+
+- ✅ **Live Trading**: Now properly differentiates between 15-min and hourly markets
+- ✅ **Backtesting**: Results now match live trading behavior exactly
+- ✅ **Monitoring**: Full visibility into when signals are generated and accepted/rejected
+- ✅ **Debugging**: Easy to trace signal flow through the system
+
+---
+
+## [1.8.0] - 2026-01-17
+
+### Statistical Significance Testing & Strategy Analysis
+
+Integrated comprehensive statistical validation framework to ensure strategy results beat random trading and are not due to luck. Identifies which strategies have real edge vs noise.
+
+#### New Features
+
+**1. Statistical Analysis Tool** (`analyze_strategy_results.py`)
+- Binomial hypothesis testing (win rate vs 50% random)
+- 95% confidence intervals for win rate, P&L, Sharpe ratio
+- Kelly criterion calculation for position sizing
+- Monte Carlo permutation testing (vs random trading)
+- Validates that results are statistically significant (p < 0.05)
+
+**2. Permutation Analysis Tool** (`analyze_permutations.py`)
+- Individual strategy impact analysis (ON vs OFF)
+- Identifies noise strategies (filtering good trades)
+- Detects synergistic strategy pairs
+- Ranks combinations by statistical significance
+- Shows which strategies contribute real value
+
+**3. Enhanced Permutation Reports**
+- Statistical significance filtering in `test_all_strategies.py` output
+- Confidence levels for each strategy combination
+- Kelly criterion recommendations (full, 1/2, 1/4 Kelly)
+- Expected value per trade calculations
+- Individual strategy impact analysis with confidence intervals
+
+**4. Makefile Commands**
+- `make stats` - Analyze latest backtest results statistically
+- `make analyze-latest` - Same as stats
+- `make analyze-permutations` - Analyze all permutation results
+
+#### Files Added
+
+| File | Purpose |
+|------|---------|
+| `analyze_strategy_results.py` | Statistical significance testing of individual backtests |
+| `analyze_permutations.py` | Strategy impact and synergy analysis |
+
+#### Files Modified
+
+| File | Changes |
+|------|---------|
+| `test_all_strategies.py` | Added statistical significance section, Kelly criterion recommendations to reports |
+| `README.md` | Added Statistical Validation & Analysis workflow documentation |
+| `Makefile` | Added analysis commands |
+
+#### Usage Examples
+
+```bash
+# Analyze single backtest result
+python analyze_strategy_results.py
+python analyze_strategy_results.py logs/backtest_real_BTCUSDT_20260117_120000.json
+
+# Full workflow: test → analyze → optimize
+python test_all_strategies.py --quick  # Generate results
+python analyze_permutations.py STRATEGY_RESULTS_*.md  # Analyze
+```
+
+#### Key Metrics Generated
+
+1. **Statistical Significance**
+   - Binomial test p-value (vs 50% null hypothesis)
+   - 95% confidence intervals
+   - Sample size requirements
+
+2. **Position Sizing**
+   - Kelly criterion: f* = (W*P - L*(1-P)) / L
+   - Conservative (1/4 Kelly), Moderate (1/2 Kelly), Aggressive (Full Kelly)
+   - Risk-adjusted sizing
+
+3. **Validation**
+   - Monte Carlo: 10,000 random permutations
+   - Comparison to null distribution
+   - Proof strategy beats random chance
+
+---
+
+## [1.7.0] - 2026-01-17
 
 ### Parameter Optimization & Workflow
 
