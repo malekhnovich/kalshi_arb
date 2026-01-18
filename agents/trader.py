@@ -791,12 +791,16 @@ class TraderAgent(BaseAgent):
         partial_tag = " [PARTIAL FILL]" if is_partial else ""
 
         print(f"\n{'='*60}")
-        print(f"[{self.name}] {mode_tag}{realistic_tag} TRADE EXECUTED{partial_tag}")
+        print(f"🟢 [{self.name}] {mode_tag}{realistic_tag} TRADE ENTERED{partial_tag}")
         print(f"{'='*60}")
         print(f"  Order ID:     {position.id}")
         print(f"  Market:       {signal.market_ticker}")
         print(f"  Symbol:       {signal.symbol}")
         print(f"  Side:         {side.upper()}")
+        print(f"  Quantity:     {actual_filled_qty} contracts")
+        print(f"  Entry Price:  {actual_fill_price}c")
+        print(f"  Confidence:   {signal.confidence}%")
+        print(f"  Expected P&L: ${expected_pnl:.2f}")
         print(f"-" * 60)
         print(f"  EXECUTION DETAILS")
         print(f"  Requested:    {quantity} contracts @ {price}c")
@@ -916,7 +920,29 @@ class TraderAgent(BaseAgent):
 
         mode_tag = "[DRY-RUN]" if self.dry_run else "[LIVE]"
         pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        print(f"[{self.name}] {mode_tag} Position closed: {market_ticker} | P&L: {pnl_str} | Reason: {reason}")
+
+        # Add alert emoji based on win/loss
+        if pnl > 0:
+            emoji = "🎉"
+            result_text = "WIN"
+        elif pnl < 0:
+            emoji = "❌"
+            result_text = "LOSS"
+        else:
+            emoji = "⚪"
+            result_text = "BREAKEVEN"
+
+        print(f"\n{'='*60}")
+        print(f"{emoji} [{self.name}] {mode_tag} TRADE CLOSED - {result_text}")
+        print(f"{'='*60}")
+        print(f"  Market:       {market_ticker}")
+        print(f"  Entry Price:  {position.entry_price}c")
+        print(f"  Close Price:  {close_price}c")
+        print(f"  Contracts:    {position.quantity}")
+        print(f"  P&L:          {pnl_str}")
+        print(f"  Reason:       {reason}")
+        print(f"  Win Rate:     {self.stats.winning_trades}/{self.stats.total_trades}")
+        print(f"{'='*60}")
 
         return pnl
 

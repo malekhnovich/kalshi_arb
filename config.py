@@ -48,7 +48,7 @@ def _get_env_tuple(key: str, default: Tuple[int, int]) -> Tuple[int, int]:
 # Env: BINANCE_API_URL
 BINANCE_US_API_URL = _get_env_str("BINANCE_API_URL", "https://api.binance.us/api/v3")
 # Env: BINANCE_SYMBOLS (comma-separated, e.g., "BTCUSDT,ETHUSDT")
-BINANCE_SYMBOLS = _get_env_list("BINANCE_SYMBOLS", ["SOLUSDT", "BTCUSDT", "ETHUSDT"])
+BINANCE_SYMBOLS = _get_env_list("BINANCE_SYMBOLS", ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT"])
 # Env: POLL_INTERVAL_BINANCE
 POLL_INTERVAL_BINANCE = _get_env_int("POLL_INTERVAL_BINANCE", 5)  # seconds
 # Env: BINANCE_WS_ENABLED
@@ -103,11 +103,15 @@ _LIVE_TRADING_ENV_VAR = _get_env_str("KALSHI_ENABLE_LIVE_TRADING", "false")
 
 # Production safety limits (only apply if live trading is enabled)
 # Env: MAX_POSITION_SIZE
-MAX_POSITION_SIZE = _get_env_float("MAX_POSITION_SIZE", 25.0)  # $25 per trade
+# DEPLOYMENT: Based on Strategy Optimization (Step 2), set to $10 for Stage 1
+# Ultra-conservative starting position for initial validation
+MAX_POSITION_SIZE = _get_env_float("MAX_POSITION_SIZE", 10.0)  # $10 per trade (Stage 1)
 # Env: MAX_OPEN_POSITIONS
 MAX_OPEN_POSITIONS = _get_env_int("MAX_OPEN_POSITIONS", 3)
 # Env: MAX_DAILY_LOSS
-MAX_DAILY_LOSS = _get_env_float("MAX_DAILY_LOSS", 50.0)  # Stop trading if down $50
+# Stop trading if cumulative loss exceeds this daily threshold
+# Stage 1: $30 (conservative threshold with $10 position sizing)
+MAX_DAILY_LOSS = _get_env_float("MAX_DAILY_LOSS", 30.0)
 
 
 def is_live_trading_allowed() -> bool:
@@ -160,7 +164,9 @@ CONFIDENCE_THRESHOLD = _get_env_int("CONFIDENCE_THRESHOLD", 70)  # percent confi
 
 # Arbitrage Detection Thresholds
 # Env: MIN_ODDS_SPREAD
-MIN_ODDS_SPREAD = _get_env_float("MIN_ODDS_SPREAD", 10.0)  # Minimum spread (cents)
+# Lowered to 5.0c to capture more opportunities. With 71.4% win rate,
+# breakeven trades (5c spread - 5c fees) still profit on average.
+MIN_ODDS_SPREAD = _get_env_float("MIN_ODDS_SPREAD", 5.0)  # Minimum spread (cents)
 # Env: ODDS_NEUTRAL_RANGE (comma-separated, e.g., "45,55")
 ODDS_NEUTRAL_RANGE = _get_env_tuple("ODDS_NEUTRAL_RANGE", (45, 55))
 # Env: STRIKE_DISTANCE_THRESHOLD_PCT (within X% of strike price)
@@ -201,6 +207,7 @@ SYMBOL_MAP = {
     "SOLUSDT": {"binance": "SOLUSDT", "kalshi_prefix": "KXSOL", "base": "SOL"},
     "BTCUSDT": {"binance": "BTCUSDT", "kalshi_prefix": "KXBTC", "base": "BTC"},
     "ETHUSDT": {"binance": "ETHUSDT", "kalshi_prefix": "KXETH", "base": "ETH"},
+    "XRPUSDT": {"binance": "XRPUSDT", "kalshi_prefix": "KXXRP", "base": "XRP"},
 }
 
 # Backtesting Configuration
@@ -262,3 +269,47 @@ SIM_LATENCY_JITTER_MS = _get_env_int("SIM_LATENCY_JITTER_MS", 100)
 SIM_PRICE_MOVE_PROBABILITY = _get_env_float("SIM_PRICE_MOVE_PROBABILITY", 0.3)
 # Env: SIM_PRICE_MOVE_MAX_CENTS (max adverse price move in cents)
 SIM_PRICE_MOVE_MAX_CENTS = _get_env_float("SIM_PRICE_MOVE_MAX_CENTS", 3.0)
+
+# ============================================================================
+# POSITION SIZING - STAGE-BASED DEPLOYMENT
+# ============================================================================
+# Based on Strategy Optimization Report (generated 2026-01-17)
+#
+# STRATEGY BASELINE:
+#   - Win Rate: 71.4% (7 trades in 2 days)
+#   - Average P&L: $19.14 per trade
+#   - Max Drawdown: $96
+#   - Expected Expectancy: Positive
+#
+# DEPLOYMENT STAGES:
+#
+# Stage 1 (Days 1-14): Ultra-Conservative, Minimal Capital
+#   - Capital: $100-$200
+#   - Max Position: $10 per trade (ultra-conservative testing)
+#   - Max Open Positions: 3
+#   - Daily Loss Limit: $30 (conservative threshold)
+#   - Max Drawdown Tolerance: 10% (~$20)
+#   - Goal: Accumulate 10-15 real trades for validation with minimal risk
+#
+# Stage 2 (Days 15-30): Moderate Capital, Moderate Sizing
+#   - Capital: $1,000-$2,000
+#   - Max Position: $50-100 per trade (1/4-1/2 Kelly equivalent)
+#   - Max Open Positions: 5
+#   - Daily Loss Limit: $150-200 (10% of capital)
+#   - Max Drawdown Tolerance: 15% (~$150-300)
+#   - Goal: Accumulate 30+ trades for full statistical validation
+#
+# Stage 3+ (Full Deployment): Scale As Validated
+#   - Capital: Full allocated amount
+#   - Max Position: $300-500+ per trade (Full Kelly equivalent)
+#   - Ongoing monitoring: Daily P&L, win rate, drawdown
+#
+# RISK PROFILE (Stage 1 - Ultra-Conservative)
+# Env: STAGE_1_CAPITAL_BASE
+STAGE_1_CAPITAL_BASE = _get_env_float("STAGE_1_CAPITAL_BASE", 200.0)
+# Env: STAGE_1_MAX_POSITION
+STAGE_1_MAX_POSITION = _get_env_float("STAGE_1_MAX_POSITION", 10.0)
+# Env: STAGE_1_DAILY_LOSS_LIMIT
+STAGE_1_DAILY_LOSS_LIMIT = _get_env_float("STAGE_1_DAILY_LOSS_LIMIT", 30.0)
+# Env: STAGE_1_MAX_DRAWDOWN_PERCENT
+STAGE_1_MAX_DRAWDOWN_PERCENT = _get_env_float("STAGE_1_MAX_DRAWDOWN_PERCENT", 10.0)

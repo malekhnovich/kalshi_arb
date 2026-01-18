@@ -2,7 +2,87 @@
 
 All notable changes to the arbitrage detection system.
 
-## [1.6.0] - 2026-01-17
+## [1.8.0] - 2026-01-17
+
+### Statistical Significance Testing & Strategy Analysis
+
+Integrated comprehensive statistical validation framework to ensure strategy results beat random trading and are not due to luck. Identifies which strategies have real edge vs noise.
+
+#### New Features
+
+**1. Statistical Analysis Tool** (`analyze_strategy_results.py`)
+- Binomial hypothesis testing (win rate vs 50% random)
+- 95% confidence intervals for win rate, P&L, Sharpe ratio
+- Kelly criterion calculation for position sizing
+- Monte Carlo permutation testing (vs random trading)
+- Validates that results are statistically significant (p < 0.05)
+
+**2. Permutation Analysis Tool** (`analyze_permutations.py`)
+- Individual strategy impact analysis (ON vs OFF)
+- Identifies noise strategies (filtering good trades)
+- Detects synergistic strategy pairs
+- Ranks combinations by statistical significance
+- Shows which strategies contribute real value
+
+**3. Enhanced Permutation Reports**
+- Statistical significance filtering in `test_all_strategies.py` output
+- Confidence levels for each strategy combination
+- Kelly criterion recommendations (full, 1/2, 1/4 Kelly)
+- Expected value per trade calculations
+- Individual strategy impact analysis with confidence intervals
+
+**4. Makefile Commands**
+- `make stats` - Analyze latest backtest results statistically
+- `make analyze-latest` - Same as stats
+- `make analyze-permutations` - Analyze all permutation results
+
+#### Files Added
+
+| File | Purpose |
+|------|---------|
+| `analyze_strategy_results.py` | Statistical significance testing of individual backtests |
+| `analyze_permutations.py` | Strategy impact and synergy analysis |
+
+#### Files Modified
+
+| File | Changes |
+|------|---------|
+| `test_all_strategies.py` | Added statistical significance section, Kelly criterion recommendations to reports |
+| `README.md` | Added Statistical Validation & Analysis workflow documentation |
+| `Makefile` | Added analysis commands |
+
+#### Usage Examples
+
+```bash
+# Analyze single backtest result
+python analyze_strategy_results.py
+python analyze_strategy_results.py logs/backtest_real_BTCUSDT_20260117_120000.json
+
+# Full workflow: test → analyze → optimize
+python test_all_strategies.py --quick  # Generate results
+python analyze_permutations.py STRATEGY_RESULTS_*.md  # Analyze
+```
+
+#### Key Metrics Generated
+
+1. **Statistical Significance**
+   - Binomial test p-value (vs 50% null hypothesis)
+   - 95% confidence intervals
+   - Sample size requirements
+
+2. **Position Sizing**
+   - Kelly criterion: f* = (W*P - L*(1-P)) / L
+   - Conservative (1/4 Kelly), Moderate (1/2 Kelly), Aggressive (Full Kelly)
+   - Risk-adjusted sizing
+
+3. **Validation**
+   - Monte Carlo: 10,000 random permutations
+   - Comparison to null distribution
+   - Proof strategy beats random chance
+
+---
+
+## [1.7.0] - 2026-01-17
 
 ### Parameter Optimization & Workflow
 

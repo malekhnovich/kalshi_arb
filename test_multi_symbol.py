@@ -17,14 +17,12 @@ Usage:
 """
 
 import subprocess
-import os
-import sys
 import json
 import argparse
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict
 import statistics
 
 

@@ -41,6 +41,15 @@ When Binance shows strong directional momentum (≥70% up candles) but Kalshi pr
                    └──────────────────────┘
 ```
 
+## Pre-Live Trading Checklist
+
+Before deploying real capital, use these checklists to validate system readiness:
+
+- **[LIVE_READY_CHECKLIST.md](LIVE_READY_CHECKLIST.md)** - Quick 7-step checklist to get live-ready
+- **[PRE_LIVE_CHECKLIST.md](PRE_LIVE_CHECKLIST.md)** - Comprehensive multi-phase validation checklist
+
+Both documents include red flags (do not deploy) and success criteria (all clear to go live).
+
 ## Installation
 
 ### Requirements
@@ -119,7 +128,37 @@ python test_all_strategies.py --quick --limit-strategies 5 --verbose
 python test_all_strategies.py --full --limit-strategies 5
 ```
 
-Results are saved as `STRATEGY_RESULTS_YYYYMMDD_HHMMSS.md` with rankings and analysis.
+Results are saved as `STRATEGY_RESULTS_YYYYMMDD_HHMMSS.md` with rankings, statistical significance filtering, and Kelly-based position sizing recommendations.
+
+### Statistical Validation & Analysis
+
+After running backtests, validate results are statistically significant and not due to luck:
+
+```bash
+# Analyze latest backtest result
+python analyze_strategy_results.py
+
+# Or analyze specific backtest file
+python analyze_strategy_results.py logs/backtest_real_BTCUSDT_20260117_120000.json
+```
+
+This provides:
+- **Binomial hypothesis testing**: Win rate vs 50% (random)
+- **Confidence intervals**: 95% CI for win rate, P&L, Sharpe ratio
+- **Kelly criterion**: Optimal position sizing (full, 1/2, 1/4 Kelly)
+- **Monte Carlo validation**: Results vs random trading distribution
+
+To analyze all permutation results:
+
+```bash
+# Analyze strategy synergies and individual impact
+python analyze_permutations.py STRATEGY_RESULTS_20260117_120000.md
+```
+
+This identifies:
+- **Strategy impact**: Which strategies add value vs noise
+- **Synergies**: Strategies that work well together
+- **Optimal combinations**: Best statistical configurations
 
 ### Strategy Configuration
 
@@ -248,8 +287,11 @@ agents/
 ```
 ├── test_all_strategies.py    # Permutation testing (all 1024 combinations)
 ├── test_strategies.py        # Quick preset strategy tests
+├── analyze_strategy_results.py # Statistical analysis of backtest results
+├── analyze_permutations.py   # Permutation result analysis (significance, synergies)
 ├── compare_strategies.py     # Analysis tool for results
 ├── quick_backtest.py         # Fast backtest using cache
+├── optimize_parameters.py    # Parameter optimization with sensitivity analysis
 └── diagnose.py              # Diagnostic utility
 ```
 
@@ -347,6 +389,12 @@ agents/
 - **`quick_backtest.py`**: Fast cached backtest. Uses previously cached data for quick testing without API calls.
 
 - **`diagnose.py`**: Diagnostic utility. Checks cache status, environment variables, and recent backtest results.
+
+### Statistical Testing & Analysis
+
+- **`analyze_strategy_results.py`**: Statistical significance analysis. Validates that strategy results beat random chance using binomial tests, confidence intervals, Kelly criterion, and Monte Carlo permutation testing. Filters results by statistical significance.
+
+- **`analyze_permutations.py`**: Permutation analysis. Analyzes all 2^N strategy combinations to identify individual strategy impact, detect noise strategies, find synergistic pairs, and recommend optimal combinations based on statistical tests.
 
 ### Documentation
 

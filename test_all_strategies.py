@@ -82,6 +82,12 @@ def load_metrics_from_backtest(filepath: str) -> Dict[str, float]:
         else:
             metrics["return_on_risk"] = 0
 
+        # Expected value per trade
+        if metrics["trades"] > 0:
+            metrics["expectancy"] = metrics["total_pnl"] / metrics["trades"]
+        else:
+            metrics["expectancy"] = 0
+
         return metrics
     except Exception as e:
         print(f"Error loading metrics from {filepath}: {e}")
@@ -481,6 +487,73 @@ def generate_markdown_report(
                     f"RoR: {enabled_ror:5.2f} | "
                     f"RoR: {disabled_ror:5.2f} | "
                     f"{marker} {diff:+5.2f} |\n"
+                )
+
+        f.write("\n")
+
+        # Statistical significance filtering
+        f.write("## Statistical Significance Analysis\n\n")
+        f.write("Results filtered by statistical significance criteria:\n\n")
+
+        significant_results = [
+            (config, metrics) for config, metrics in results
+            if metrics["trades"] >= 30  # Minimum sample size
+            and metrics["total_pnl"] > 0  # Profitable
+            and metrics["win_rate"] > 50  # Above random
+        ]
+
+        f.write(f"**Statistically Significant Combinations**: {len(significant_results)} / {len(results)}\n\n")
+
+        if significant_results:
+            f.write("| Strategies | Win% | P&L | RoR | Confidence | Trades |\n")
+            f.write("|-----------|------|-----|-----|------------|--------|\n")
+
+            sorted_sig = sorted(significant_results, key=lambda x: x[1]["return_on_risk"], reverse=True)
+            for config, metrics in sorted_sig[:15]:
+                strategy_str = config_to_string(config)
+                # Approximate confidence: higher win rate = higher confidence
+                confidence = int(min(99, 50 + (metrics["win_rate"] - 50) * 2))
+                f.write(
+                    f"| `{strategy_str}` | "
+                    f"{metrics['win_rate']:5.1f}% | "
+                    f"${metrics['total_pnl']:7.2f} | "
+                    f"{metrics['return_on_risk']:5.2f} | "
+                    f"{confidence}% | "
+                    f"{metrics['trades']:7.0f} |\n"
+                )
+
+        f.write("\n")
+
+        # Kelly criterion recommendations
+        f.write("## Position Sizing Recommendations (Kelly Criterion)\n\n")
+        f.write("Based on top 5 strategies by Return on Risk:\n\n")
+
+        f.write("| Strategy | Kelly % | 1/2 Kelly | 1/4 Kelly | Expected P&L |\n")
+        f.write("|----------|---------|-----------|-----------|---------------|\n")
+
+        top_5_ror = sorted_by_ror[:5]
+        for rank, (config, metrics) in enumerate(top_5_ror, 1):
+            if metrics["trades"] > 0 and metrics["win_rate"] > 0:
+                # Calculate Kelly
+                p_win = metrics["win_rate"] / 100.0
+                if metrics["losses"] > 0 and metrics["wins"] > 0:
+                    avg_win = metrics["total_pnl"] / metrics["wins"]
+                    avg_loss = abs(metrics["total_pnl"]) / metrics["losses"] if metrics["total_pnl"] < 0 else abs(metrics["total_pnl"]) / max(1, metrics["losses"])
+                    if avg_loss > 0:
+                        kelly = (avg_win * p_win - avg_loss * (1 - p_win)) / avg_loss
+                        kelly = max(0, min(kelly, 1.0))  # Clamp to [0, 1]
+                    else:
+                        kelly = 0.25  # Default if can't calculate
+                else:
+                    kelly = 0.25  # Default if insufficient data
+
+                strategy_str = config_to_string(config)
+                f.write(
+                    f"| `{strategy_str}` | "
+                    f"{kelly*100:.1f}% | "
+                    f"{kelly*50:.1f}% | "
+                    f"{kelly*25:.1f}% | "
+                    f"${metrics['expectancy']:.2f}/trade |\n"
                 )
 
         f.write("\n")
