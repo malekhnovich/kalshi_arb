@@ -1,7 +1,7 @@
 .PHONY: push tmux help test-quick test-full test-suite-quick test-suite-full optimize-quick optimize-full tsa dryrun dryrun-debug
 
 # Git commands
-push:
+gcp:
 	git add .
 	git commit -m "Auto-commit from Makefile"
 	git push

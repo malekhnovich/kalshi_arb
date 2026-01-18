@@ -178,6 +178,13 @@ class ArbitrageDetectorAgent(BaseAgent):
             distance_pct = abs(price_event.price - strike_price) / strike_price
             dist_check = distance_pct <= self.strike_distance_threshold
 
+        # STRATEGY: Apply all filters before generating signal
+        # Check additional strategy filters (MUST BE BEFORE debug logging below)
+        vol_passes, vol_reason = self._check_volatility_filter(symbol)
+        pullback_passes, pullback_reason = self._check_pullback_entry(symbol, price_event.price)
+        time_passes, time_reason = self._check_time_filter(event_time)
+        corr_passes, corr_reason = self._check_correlation(symbol)
+
         # Debug logging for skipped signals (only log if momentum is significant)
         if (strong_up or strong_down) and not (
             odds_neutral and is_accelerating and dist_check and vol_passes and pullback_passes and time_passes and corr_passes
@@ -204,13 +211,6 @@ class ArbitrageDetectorAgent(BaseAgent):
             print(
                 f"[{self.name}] Skipping {symbol}: Momentum={momentum:.1f}, Reasons={', '.join(reasons)}"
             )
-
-        # STRATEGY: Apply all filters before generating signal
-        # Check additional strategy filters
-        vol_passes, vol_reason = self._check_volatility_filter(symbol)
-        pullback_passes, pullback_reason = self._check_pullback_entry(symbol, price_event.price)
-        time_passes, time_reason = self._check_time_filter(event_time)
-        corr_passes, corr_reason = self._check_correlation(symbol)
 
         # Determine minimum spread based on strategy
         min_spread = self.min_odds_spread
