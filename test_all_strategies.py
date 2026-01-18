@@ -89,13 +89,21 @@ def load_metrics_from_backtest(filepath: str) -> Dict[str, float]:
 
 
 def run_backtest_with_config(
-    config: List[bool], days: int = 2, verbose: bool = False
+    config: List[bool], days: int = 2, verbose: bool = False, strategies_to_test: List[str] = None
 ) -> Dict[str, float]:
     """Run a single backtest with specified strategy configuration"""
     # Build environment
     env = os.environ.copy()
-    for strategy, enabled in zip(STRATEGIES, config):
+
+    # Set the strategies being tested
+    strategies_to_test = strategies_to_test or STRATEGIES
+    for strategy, enabled in zip(strategies_to_test, config):
         env[strategy] = "true" if enabled else "false"
+
+    # IMPORTANT: Disable strategies NOT being tested to avoid them blocking trades
+    for strategy in STRATEGIES:
+        if strategy not in strategies_to_test:
+            env[strategy] = "false"
 
     # Run backtest with longer timeout (2 days = ~5 min, 7 days = ~15-20 min)
     timeout_seconds = 600 if days <= 2 else 1200  # 10 min for quick, 20 min for full
@@ -294,7 +302,7 @@ def main():
             flush=True,
         )
 
-        metrics = run_backtest_with_config(config_list, days, verbose=args.verbose)
+        metrics = run_backtest_with_config(config_list, days, verbose=args.verbose, strategies_to_test=strategies_to_test)
 
         if metrics:
             results.append((config_list, metrics))

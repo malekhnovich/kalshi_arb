@@ -2,6 +2,27 @@
 
 All notable changes to the arbitrage detection system.
 
+## [1.6.0] - 2026-01-17
+
+### Parameter Optimization & Workflow
+
+Added parameter optimization capabilities and formalized the development workflow.
+
+#### New Features
+
+**1. Parameter Optimization**
+- Added support for testing parameter ranges (volatility, spread, pullback)
+- Sensitivity analysis reporting
+- Results saved to `PARAM_OPTIMIZATION_YYYYMMDD_HHMMSS.md`
+
+**2. Workflow Documentation**
+- Added comprehensive Workflow section to README
+- Defined clear steps from data collection to live trading
+
+#### Improvements
+- Updated strategy results with latest 2026-01-17 data (Win rates >90% observed)
+- Refined documentation for clarity
+
 ## [1.5.0] - 2026-01-16
 
 ### Strategy Permutation Testing System
