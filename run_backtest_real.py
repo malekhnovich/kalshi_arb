@@ -606,10 +606,13 @@ class RealKalshiBacktester:
         momentum: float,
         trend_confirmed: bool,
         kalshi_yes: float,
+        market_ticker: str = "",
     ) -> Optional[tuple[str, float, float]]:
         """Check if conditions warrant a signal."""
-        strong_up = momentum >= self.confidence_threshold
-        strong_down = momentum <= (100 - self.confidence_threshold)
+        # Use market-specific threshold (65% for 15-min, 70% for hourly)
+        market_threshold = strategies.get_momentum_threshold_for_market(market_ticker)
+        strong_up = momentum >= market_threshold
+        strong_down = momentum <= (100 - market_threshold)
 
         if not (strong_up or strong_down):
             return None
@@ -722,11 +725,12 @@ class RealKalshiBacktester:
             kalshi_data_points_used += 1
             matches_found += 1
 
-            # Extract yes price from trade data
+            # Extract yes price and market ticker from trade data
             yes_price = kalshi_market_data.get("yes_price", 50)
+            market_ticker = kalshi_market_data.get("market_ticker", "")
 
             # Check for signal
-            signal = self.check_signal(momentum, trend_confirmed, yes_price)
+            signal = self.check_signal(momentum, trend_confirmed, yes_price, market_ticker)
 
             if signal and len(self.open_trades) < self.max_open_trades:
                 direction, confidence, spread = signal

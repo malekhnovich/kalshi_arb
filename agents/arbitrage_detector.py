@@ -144,8 +144,12 @@ class ArbitrageDetectorAgent(BaseAgent):
                     is_accelerating = recent_avg <= older_avg + 2
 
         # Determine if spot shows strong direction
-        strong_up = momentum >= self.confidence_threshold
-        strong_down = momentum <= (100 - self.confidence_threshold)
+        # Use market-specific threshold (65% for 15-min, 70% for hourly)
+        market_threshold = strategies.get_momentum_threshold_for_market(
+            kalshi_event.market_ticker
+        )
+        strong_up = momentum >= market_threshold
+        strong_down = momentum <= (100 - market_threshold)
 
         # STRATEGY: Trend Confirmation
         trend_bonus = 0.0
@@ -281,6 +285,13 @@ class ArbitrageDetectorAgent(BaseAgent):
                     spread=round(spread, 1),
                     fair_probability=round(fair_prob, 1),
                     recommendation=recommendation,
+                )
+
+                # Log signal generation
+                print(
+                    f"\n[{self.name}] 🎯 SIGNAL GENERATED: {price_event.symbol} {direction} "
+                    f"(Confidence: {confidence:.1f}%, Momentum: {momentum:.1f}%, "
+                    f"Spread: {spread:.1f}c)"
                 )
 
                 await self.publish(signal)

@@ -657,12 +657,19 @@ class TraderAgent(BaseAgent):
 
         self.stats.signals_received += 1
 
+        # Log signal receipt with key details
+        print(
+            f"\n[{self.name}] 📊 SIGNAL RECEIVED: {event.symbol} {event.direction} "
+            f"(Confidence: {event.confidence}%, Spread: {event.spread}c, "
+            f"Kalshi: {event.kalshi_yes_price}c)"
+        )
+
         # Check if we should trade this signal
         should_trade, reason = self._should_trade(event)
 
         if not should_trade:
             self.stats.signals_skipped += 1
-            print(f"[{self.name}] Skipping signal: {reason}")
+            print(f"[{self.name}] ⏭️  Skipping signal: {reason}")
             return
 
         # Execute the trade
