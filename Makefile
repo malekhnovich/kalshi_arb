@@ -41,19 +41,39 @@ optimize-full:
 tsa:
 	$(MAKE) test-suite-quick
 
+# Multi-symbol backtest (test across BTC, ETH, SOL)
+multi-quick:
+	python test_multi_symbol.py --quick
+
+multi-full:
+	python test_multi_symbol.py --full
+
+# Statistical testing and analysis commands
+stats:
+	python -c "from statistical_testing import StrategyStatistics; print('Statistics module ready. Use: from statistical_testing import StrategyStatistics')"
+
+kelly:
+	python position_sizing.py
+
 # Help/info
 help:
 	@echo "=== ARBITRAGE BACKTEST COMMANDS ==="
 	@echo ""
 	@echo "Quick Tests (2 days):"
-	@echo "  make test-quick           - Single backtest with all strategies"
+	@echo "  make test-quick           - Single backtest (BTCUSDT, all strategies)"
 	@echo "  make test-suite-quick     - Test 5 strategies (32 permutations)"
-	@echo "  make optimize-quick       - Test parameter combinations (16 tests)"
+	@echo "  make optimize-quick       - Test parameters (16 combinations)"
+	@echo "  make multi-quick          - Test BTC/ETH/SOL (3 symbols)"
 	@echo ""
 	@echo "Full Tests (7 days):"
-	@echo "  make test-full            - Single backtest with all strategies"
-	@echo "  make test-suite-full      - Test all 10 strategies (1024 permutations)"
-	@echo "  make optimize-full        - Test parameter combinations (256 tests)"
+	@echo "  make test-full            - Single backtest (BTCUSDT, all strategies)"
+	@echo "  make test-suite-full      - Test all 10 strategies (1024 perms)"
+	@echo "  make optimize-full        - Test all parameters (256 combinations)"
+	@echo "  make multi-full           - Test BTC/ETH/SOL (3 symbols)"
+	@echo ""
+	@echo "Analysis & Tools:"
+	@echo "  make stats                - Test statistical significance module"
+	@echo "  make kelly                - Test Kelly criterion position sizing"
 	@echo ""
 	@echo "Other:"
 	@echo "  make push                 - Git add, commit, and push"
