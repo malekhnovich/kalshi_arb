@@ -62,7 +62,8 @@ KALSHI_API_URL = _get_env_str(
 # Env: POLL_INTERVAL_KALSHI
 POLL_INTERVAL_KALSHI = _get_env_int("POLL_INTERVAL_KALSHI", 10)  # seconds
 # Env: KALSHI_CRYPTO_SERIES (comma-separated)
-KALSHI_CRYPTO_SERIES = _get_env_list("KALSHI_CRYPTO_SERIES", ["KXBTC", "KXETH"])
+# Updated to include all 4 crypto series: BTC, ETH, SOL, XRP
+KALSHI_CRYPTO_SERIES = _get_env_list("KALSHI_CRYPTO_SERIES", ["KXBTC", "KXETH", "KXSOL", "KXXRP"])
 
 # Kalshi API Authentication (for historical data access)
 # Env: KALSHI_API_KEY

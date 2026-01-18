@@ -701,6 +701,33 @@ class TraderAgent(BaseAgent):
     async def _execute_trade(self, signal: ArbitrageSignalEvent) -> None:
         """Execute a trade based on the signal"""
 
+        # CHECK: Daily loss limit
+        if self.stats.realized_pnl <= -config.MAX_DAILY_LOSS:
+            print(f"\n{'='*60}")
+            print(f"🛑 [{self.name}] DAILY LOSS LIMIT EXCEEDED")
+            print(f"{'='*60}")
+            print(f"  Daily Loss Limit: ${config.MAX_DAILY_LOSS}")
+            print(f"  Current P&L:      ${self.stats.realized_pnl:.2f}")
+            print(f"  Action: HALTING NEW TRADES")
+            print(f"  Existing positions will still close when markets settle")
+            print(f"{'='*60}")
+            self.stats.signals_skipped += 1
+            return
+
+        # CHECK: Max drawdown limit
+        if config.STAGE_1_MAX_DRAWDOWN_PERCENT > 0:
+            max_allowed_drawdown = config.STAGE_1_CAPITAL_BASE * (config.STAGE_1_MAX_DRAWDOWN_PERCENT / 100)
+            if self.stats.max_drawdown > max_allowed_drawdown:
+                print(f"\n{'='*60}")
+                print(f"🛑 [{self.name}] MAX DRAWDOWN LIMIT EXCEEDED")
+                print(f"{'='*60}")
+                print(f"  Max Drawdown Allowed: ${max_allowed_drawdown:.2f}")
+                print(f"  Current Drawdown:     ${self.stats.max_drawdown:.2f}")
+                print(f"  Action: HALTING NEW TRADES")
+                print(f"{'='*60}")
+                self.stats.signals_skipped += 1
+                return
+
         # Determine side and price
         if signal.direction == "UP":
             side = "yes"

@@ -90,11 +90,74 @@ kelly:
 # Live trading (dry-run mode for testing)
 dryrun:
 	@echo "Starting dry-run trading (simulated, no real money)..."
-	@uv run python run_trader.py
+	@echo "Log file: logs/dryrun_$(shell date +%Y%m%d_%H%M%S).log"
+	@uv run python run_trader.py | tee logs/dryrun_$(shell date +%Y%m%d_%H%M%S).log
 
 dryrun-debug:
 	@echo "Starting dry-run trading with debug output..."
-	@uv run python run_trader.py --debug
+	@echo "Log file: logs/dryrun_debug_$(shell date +%Y%m%d_%H%M%S).log"
+	@uv run python run_trader.py --debug | tee logs/dryrun_debug_$(shell date +%Y%m%d_%H%M%S).log
+
+# Check for trades in dry-run logs
+check-trades:
+	@echo "=== CHECKING FOR EXECUTED TRADES ===" && \
+	if [ -f "$$(ls -t logs/dryrun*.log 2>/dev/null | head -1)" ]; then \
+		LATEST=$$(ls -t logs/dryrun*.log 2>/dev/null | head -1); \
+		echo "Latest log: $$LATEST" && \
+		echo "" && \
+		TRADE_COUNT=$$(grep -c "TRADE ENTERED\|TRADE CLOSED" "$$LATEST" 2>/dev/null || echo "0"); \
+		if [ "$$TRADE_COUNT" -eq 0 ]; then \
+			echo "❌ No trades found yet in latest log"; \
+		else \
+			echo "✅ Found $$TRADE_COUNT trade events" && \
+			echo "" && \
+			echo "=== TRADE ENTRIES ===" && \
+			grep "TRADE ENTERED" "$$LATEST" || echo "No entries yet" && \
+			echo "" && \
+			echo "=== TRADE CLOSURES ===" && \
+			grep "TRADE CLOSED" "$$LATEST" || echo "No closures yet" && \
+			echo "" && \
+			echo "=== WIN/LOSS SUMMARY ===" && \
+			WINS=$$(grep -c "WIN" "$$LATEST" 2>/dev/null || echo "0"); \
+			LOSSES=$$(grep -c "LOSS" "$$LATEST" 2>/dev/null || echo "0"); \
+			echo "Wins: $$WINS | Losses: $$LOSSES"; \
+		fi; \
+	else \
+		echo "❌ No dry-run logs found. Start a dry-run first with 'make dryrun' or 'make dryrun-debug'"; \
+	fi
+
+check-trades-all:
+	@echo "=== CHECKING ALL DRY-RUN LOGS ===" && \
+	if ls logs/dryrun*.log 1> /dev/null 2>&1; then \
+		echo "Found $$(ls logs/dryrun*.log 2>/dev/null | wc -l) log files" && \
+		echo "" && \
+		for log in $$(ls -t logs/dryrun*.log); do \
+			TRADE_COUNT=$$(grep -c "TRADE ENTERED\|TRADE CLOSED" "$$log" 2>/dev/null || echo "0"); \
+			WINS=$$(grep -c "WIN" "$$log" 2>/dev/null || echo "0"); \
+			LOSSES=$$(grep -c "LOSS" "$$log" 2>/dev/null || echo "0"); \
+			echo "$$log: Trades=$$TRADE_COUNT | Wins=$$WINS | Losses=$$LOSSES"; \
+		done; \
+	else \
+		echo "❌ No dry-run logs found"; \
+	fi
+
+check-wins:
+	@echo "=== WINNING TRADES ===" && \
+	if [ -f "$$(ls -t logs/dryrun*.log 2>/dev/null | head -1)" ]; then \
+		LATEST=$$(ls -t logs/dryrun*.log 2>/dev/null | head -1); \
+		grep -A 5 "TRADE CLOSED - WIN" "$$LATEST" 2>/dev/null || echo "No winning trades found"; \
+	else \
+		echo "❌ No dry-run logs found"; \
+	fi
+
+check-losses:
+	@echo "=== LOSING TRADES ===" && \
+	if [ -f "$$(ls -t logs/dryrun*.log 2>/dev/null | head -1)" ]; then \
+		LATEST=$$(ls -t logs/dryrun*.log 2>/dev/null | head -1); \
+		grep -A 5 "TRADE CLOSED - LOSS" "$$LATEST" 2>/dev/null || echo "No losing trades found"; \
+	else \
+		echo "❌ No dry-run logs found"; \
+	fi
 
 # Pre-live checklists
 checklist:
@@ -130,6 +193,10 @@ help:
 	@echo "Live Trading (Dry-Run):"
 	@echo "  make dryrun               - Run dry-run trading simulator (no real money)"
 	@echo "  make dryrun-debug         - Run dry-run with debug output"
+	@echo "  make check-trades         - Check if trades were executed (latest log)"
+	@echo "  make check-trades-all     - Show all trades across all logs"
+	@echo "  make check-wins           - Show only winning trades"
+	@echo "  make check-losses         - Show only losing trades"
 	@echo ""
 	@echo "Pre-Live Deployment:"
 	@echo "  make checklist            - Show quick 7-step live readiness checklist"
