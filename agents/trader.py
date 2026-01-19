@@ -58,6 +58,7 @@ class Position:
     closed: bool = False
     close_timestamp: Optional[datetime] = None
     close_price: Optional[float] = None
+    market_close: Optional[datetime] = None  # When the Kalshi market closes
 
     def update_pnl(self, current_price: float) -> None:
         """Update unrealized P&L based on current price (in dollars)"""
@@ -98,6 +99,7 @@ class Position:
             "closed": self.closed,
             "close_timestamp": self.close_timestamp.isoformat() if self.close_timestamp else None,
             "close_price": self.close_price,
+            "market_close": self.market_close.isoformat() if self.market_close else None,
         }
 
 
@@ -644,6 +646,7 @@ class TraderAgent(BaseAgent):
         print(f"[{self.name}] Started in {mode} mode")
         print(f"[{self.name}] Max position: ${self.max_position_size}")
         print(f"[{self.name}] Max open positions: {self.max_open_positions}")
+        print(f"[{self.name}] Position hold duration: {config.POSITION_HOLD_DURATION}s (time-based exit)")
 
     async def on_stop(self) -> None:
         """Print final stats and save results"""
@@ -789,6 +792,7 @@ class TraderAgent(BaseAgent):
             quantity=actual_filled_qty,  # Use actual filled quantity
             entry_price=actual_fill_price,  # Use actual fill price
             current_price=actual_fill_price,
+            market_close=signal.market_close,  # Track when this market closes
         )
 
         self.positions[signal.market_ticker] = position
@@ -871,11 +875,14 @@ class TraderAgent(BaseAgent):
         await asyncio.sleep(5)  # Update every 5 seconds
 
     async def _update_positions(self) -> None:
-        """Fetch current market prices and update position P&L"""
+        """Fetch current market prices, update P&L, and check for exits"""
         open_positions = [p for p in self.positions.values() if not p.closed]
 
         if not open_positions:
             return
+
+        now = datetime.now()
+        hold_duration = timedelta(seconds=config.POSITION_HOLD_DURATION)
 
         async with httpx.AsyncClient(timeout=15) as client:
             for position in open_positions:
@@ -914,10 +921,23 @@ class TraderAgent(BaseAgent):
                                 close_price = 0 if position.side == "yes" else 100
 
                             await self.close_position(position.market_ticker, close_price, f"market resolved: {result}")
+                            continue
+
+                        # TIME-BASED EXIT: Close position after hold duration expires
+                        time_held = now - position.timestamp
+                        if time_held >= hold_duration:
+                            # Use current market price for exit (with slippage for sell)
+                            exit_price = max(1, current_price - config.EXIT_SLIPPAGE_CENTS)
+                            time_held_secs = int(time_held.total_seconds())
+                            await self.close_position(
+                                position.market_ticker,
+                                exit_price,
+                                f"time-based exit ({time_held_secs}s held, max {config.POSITION_HOLD_DURATION}s)"
+                            )
 
                 except Exception as e:
-                    # Silently continue on errors
-                    pass
+                    # Log errors for debugging
+                    print(f"[{self.name}] Error updating position {position.market_ticker}: {e}")
 
     async def close_position(
         self,

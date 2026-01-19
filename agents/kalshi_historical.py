@@ -116,6 +116,50 @@ class KalshiHistoricalClient:
         self._rate_limiter = asyncio.Semaphore(config.KALSHI_READ_LIMIT_PER_SECOND)
         self._last_request_times: List[float] = []
 
+        # BUGFIX #6: Adaptive rate limiting
+        self._current_rate_limit = config.KALSHI_READ_LIMIT_PER_SECOND  # Requests per second
+        self._rate_limit_hits = 0  # Track consecutive 429 responses
+        self._last_rate_adjust_time = time.time()
+        self._successful_requests = 0
+        self._failed_requests = 0
+
+    def _adjust_rate_limit(self, hit_rate_limit: bool) -> None:
+        """
+        BUGFIX #6: Adaptive rate limiting based on server feedback.
+
+        Reduces request rate when hitting 429 (too many requests).
+        Gradually increases rate when requests succeed.
+        """
+        now = time.time()
+        time_since_adjust = now - self._last_rate_adjust_time
+
+        if hit_rate_limit:
+            # Back off aggressively when hitting rate limits
+            self._rate_limit_hits += 1
+            backoff_factor = min(1.0 / (2 ** self._rate_limit_hits), 0.1)
+            self._current_rate_limit = max(1, self._current_rate_limit * backoff_factor)
+            logger.warning(
+                f"Rate limit hit (#{self._rate_limit_hits}). "
+                f"Adjusting rate to {self._current_rate_limit:.2f} req/s"
+            )
+        else:
+            # Reset hit counter and gradually increase rate
+            if self._rate_limit_hits > 0:
+                self._rate_limit_hits = 0
+
+            # Every 60 seconds of success, try to increase rate by 10%
+            if time_since_adjust > 60.0:
+                old_rate = self._current_rate_limit
+                self._current_rate_limit = min(
+                    config.KALSHI_READ_LIMIT_PER_SECOND,
+                    self._current_rate_limit * 1.1,
+                )
+                if old_rate < self._current_rate_limit:
+                    logger.info(
+                        f"Rate limit recovery: {old_rate:.2f} → {self._current_rate_limit:.2f} req/s"
+                    )
+                self._last_rate_adjust_time = now
+
     async def _request(
         self,
         method: str,
@@ -123,20 +167,26 @@ class KalshiHistoricalClient:
         params: Optional[Dict] = None,
         retry_count: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        """Make authenticated request to Kalshi API with basic rate limiting."""
+        """Make authenticated request to Kalshi API with adaptive rate limiting."""
         url = f"{self.base_url}{endpoint}"
         headers = self.auth.get_auth_headers(method, endpoint)
         print(f"Making request: {url}")
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                # Simple sliding window rate limit (very basic)
+                # BUGFIX #6: Adaptive sliding window rate limit
                 now = time.time()
+                window_size = 1.0
+                current_limit = max(1, int(self._current_rate_limit))
+
+                # Clean up old request times outside the window
                 self._last_request_times = [
-                    t for t in self._last_request_times if now - t < 1.0
+                    t for t in self._last_request_times if now - t < window_size
                 ]
-                if len(self._last_request_times) >= config.KALSHI_READ_LIMIT_PER_SECOND:
-                    wait_time = 1.1 - (now - self._last_request_times[0])
+
+                # Wait if we've hit the current rate limit
+                if len(self._last_request_times) >= current_limit:
+                    wait_time = window_size - (now - self._last_request_times[0])
                     if wait_time > 0:
                         await asyncio.sleep(wait_time)
 
@@ -150,26 +200,38 @@ class KalshiHistoricalClient:
                     )
 
                 if resp.status_code == 200:
+                    self._successful_requests += 1
+                    self._adjust_rate_limit(hit_rate_limit=False)
                     return resp.json()
+
                 elif resp.status_code == 429:
+                    self._failed_requests += 1
+                    self._adjust_rate_limit(hit_rate_limit=True)
+
                     if retry_count >= 10:
                         logger.error(f"Rate limit hit max retries for {endpoint}")
                         return None
 
+                    # Exponential backoff with jitter
+                    backoff = (1.0 * (retry_count + 1)) + (0.1 * retry_count)
                     logger.warning(
-                        f"Rate limit hit! Backing off... (attempt {retry_count + 1})"
+                        f"Rate limit 429 (attempt {retry_count + 1}/10). "
+                        f"Backing off {backoff:.2f}s..."
                     )
-                    await asyncio.sleep(1.0 * (retry_count + 1))
+                    await asyncio.sleep(backoff)
                     return await self._request(
                         method, endpoint, params, retry_count + 1
                     )
+
                 else:
+                    self._failed_requests += 1
                     logger.warning(
                         f"{endpoint} returned {resp.status_code}: {resp.text[:200]}"
                     )
                     return None
 
             except Exception as e:
+                self._failed_requests += 1
                 logger.error(f"Request failed: {e}")
                 return None
 
