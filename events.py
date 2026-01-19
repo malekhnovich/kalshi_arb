@@ -85,6 +85,7 @@ class ArbitrageSignalEvent(BaseEvent):
     spread: float = 0.0  # Difference between expected odds and actual
     fair_probability: float = 50.0  # Volatility-based theoretical probability
     recommendation: str = ""
+    market_close: Optional[datetime] = None  # When the Kalshi market closes/settles
 
     def __post_init__(self):
         self.event_type = EventType.ARBITRAGE_SIGNAL

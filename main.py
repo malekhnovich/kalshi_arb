@@ -11,9 +11,9 @@ Usage:
 import requests
 import json
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import argparse
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 class BinanceAnalyzer:
     """Analyze Binance.US price movements vs Polymarket trading patterns"""

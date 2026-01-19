@@ -176,11 +176,20 @@ class ArbitrageDetectorAgent(BaseAgent):
         odds_neutral = neutral_range[0] <= yes_price <= neutral_range[1]
 
         # IMPROVEMENT 6: Strike price distance check
+        # We want price to be AWAY from strike (not near it) for a real edge
+        # If price is too close to strike, it's a coin-flip with no arbitrage
         strike_price = kalshi_event.strike_price
         dist_check = True
+        distance_pct = 0.0
         if strike_price:
             distance_pct = abs(price_event.price - strike_price) / strike_price
-            dist_check = distance_pct <= self.strike_distance_threshold
+            # FIXED: Trade when price is AWAY from strike (>= threshold), not close to it
+            dist_check = distance_pct >= self.strike_distance_threshold
+
+        # Determine minimum spread based on strategy (MUST BE BEFORE logging below)
+        min_spread = self.min_odds_spread
+        if strategies.STRATEGY_TIGHT_SPREAD_FILTER:
+            min_spread = max(min_spread, strategies.STRATEGY_MIN_SPREAD_CENTS)
 
         # STRATEGY: Apply all filters before generating signal
         # Check additional strategy filters (MUST BE BEFORE debug logging below)
@@ -188,10 +197,29 @@ class ArbitrageDetectorAgent(BaseAgent):
         pullback_passes, pullback_reason = self._check_pullback_entry(symbol, price_event.price)
         time_passes, time_reason = self._check_time_filter(event_time)
         corr_passes, corr_reason = self._check_correlation(symbol)
+        multiframe_passes, multiframe_reason = self._check_multiframe_confirmation(
+            symbol, momentum, kalshi_event.market_ticker
+        )
+
+        # COMPREHENSIVE TRADE DECISION LOGGING
+        # Log every decision point for debugging
+        print(f"\n[{self.name}] TRADE DECISION FOR {symbol} @ {kalshi_event.market_ticker}")
+        print(f"  Momentum: {momentum:.1f}% (threshold: {market_threshold}%)")
+        print(f"  Strong signal: {'✓ UP' if strong_up else '✗ DOWN' if strong_down else '✗ NEUTRAL'}")
+        print(f"  Kalshi odds: {yes_price}c (neutral range: {neutral_range})")
+        print(f"  Odds neutral: {'✓' if odds_neutral else '✗'}")
+        print(f"  Spread: {spread:.1f}c (min required: {min_spread:.1f}c)")
+        print(f"  Accelerating: {'✓' if is_accelerating else '✗'}")
+        print(f"  Distance check: {'✓' if dist_check else '✗'}")
+        print(f"  Volatility: {'✓' if vol_passes else f'✗ ({vol_reason})'}")
+        print(f"  Pullback: {'✓' if pullback_passes else f'✗ ({pullback_reason})'}")
+        print(f"  Time filter: {'✓' if time_passes else f'✗ ({time_reason})'}")
+        print(f"  Correlation: {'✓' if corr_passes else f'✗ ({corr_reason})'}")
+        print(f"  Multiframe: {'✓' if multiframe_passes else f'✗ ({multiframe_reason})'}")
 
         # Debug logging for skipped signals (only log if momentum is significant)
         if (strong_up or strong_down) and not (
-            odds_neutral and is_accelerating and dist_check and vol_passes and pullback_passes and time_passes and corr_passes
+            odds_neutral and is_accelerating and dist_check and vol_passes and pullback_passes and time_passes and corr_passes and multiframe_passes
         ):
             # Calculate what failure caused the skip
             reasons = []
@@ -201,7 +229,7 @@ class ArbitrageDetectorAgent(BaseAgent):
                 reasons.append("Decelerating")
             if not dist_check:
                 reasons.append(
-                    f"TooFar({distance_pct * 100:.1f}% > {self.strike_distance_threshold * 100}%)"
+                    f"TooClose({distance_pct * 100:.1f}% < {self.strike_distance_threshold * 100}% min)"
                 )
             if not vol_passes:
                 reasons.append(f"Volatility({vol_reason})")
@@ -211,15 +239,10 @@ class ArbitrageDetectorAgent(BaseAgent):
                 reasons.append(f"Time({time_reason})")
             if not corr_passes:
                 reasons.append(f"Correlation({corr_reason})")
+            if not multiframe_passes:
+                reasons.append(f"Multiframe({multiframe_reason})")
 
-            print(
-                f"[{self.name}] Skipping {symbol}: Momentum={momentum:.1f}, Reasons={', '.join(reasons)}"
-            )
-
-        # Determine minimum spread based on strategy
-        min_spread = self.min_odds_spread
-        if strategies.STRATEGY_TIGHT_SPREAD_FILTER:
-            min_spread = max(min_spread, strategies.STRATEGY_MIN_SPREAD_CENTS)
+            print(f"  ❌ REJECTED: {', '.join(reasons)}")
 
         # Arbitrage exists if spot is directional but odds are neutral
         if (
@@ -231,6 +254,7 @@ class ArbitrageDetectorAgent(BaseAgent):
             and pullback_passes
             and time_passes
             and corr_passes
+            and multiframe_passes
         ):
             direction = "UP" if strong_up else "DOWN"
 
@@ -285,14 +309,18 @@ class ArbitrageDetectorAgent(BaseAgent):
                     spread=round(spread, 1),
                     fair_probability=round(fair_prob, 1),
                     recommendation=recommendation,
+                    market_close=kalshi_event.expiration,  # When the market expires/closes
                 )
 
-                # Log signal generation
+                # Log signal generation with full decision path
                 print(
-                    f"\n[{self.name}] 🎯 SIGNAL GENERATED: {price_event.symbol} {direction} "
-                    f"(Confidence: {confidence:.1f}%, Momentum: {momentum:.1f}%, "
-                    f"Spread: {spread:.1f}c)"
+                    f"\n[{self.name}] ✅ ACCEPTED - 🎯 SIGNAL GENERATED: {price_event.symbol} {direction}"
                 )
+                print(f"  Confidence: {confidence:.1f}%")
+                print(f"  Momentum: {momentum:.1f}% (vs {market_threshold}% threshold)")
+                print(f"  Kalshi: {yes_price}c (expected: {expected_odds:.0f}c)")
+                print(f"  Spread: {spread:.1f}c")
+                print(f"  Fair probability: {fair_prob:.1f}%")
 
                 await self.publish(signal)
                 self._last_signal_time[signal_key] = event_time
@@ -413,6 +441,60 @@ class ArbitrageDetectorAgent(BaseAgent):
         has_position = symbol in self._open_positions
         reason = "ok" if not has_position else f"already_open"
         return not has_position, reason
+
+    def _check_multiframe_confirmation(
+        self, symbol: str, momentum: float, market_ticker: str
+    ) -> tuple[bool, str]:
+        """
+        STRATEGY: Multi-timeframe Confirmation
+        Require strong momentum on both primary and shorter timeframes.
+
+        Currently validates using momentum consistency across readings.
+        In the future, this will check actual 5-minute candle data separately.
+
+        Returns: (passes_filter, reason)
+        """
+        if not strategies.STRATEGY_MULTIFRAME_CONFIRMATION:
+            return True, "disabled"
+
+        # Get the momentum history for this symbol
+        history = self._momentum_history.get(symbol, [])
+
+        # Need at least 2 readings to compare
+        if len(history) < 2:
+            return True, "insufficient_history"
+
+        # Get market-specific thresholds
+        primary_threshold = strategies.get_momentum_threshold_for_market(market_ticker)
+        secondary_threshold = strategies.STRATEGY_MULTIFRAME_MOMENTUM_THRESHOLD
+
+        # Current momentum check
+        strong_primary = (
+            momentum >= primary_threshold or momentum <= (100 - primary_threshold)
+        )
+
+        # Recent momentum history check (proxy for secondary timeframe)
+        recent_momentum = history[-1]
+        strong_secondary = (
+            recent_momentum >= secondary_threshold
+            or recent_momentum <= (100 - secondary_threshold)
+        )
+
+        # Both timeframes must show directional bias in same direction
+        same_direction = (momentum >= 50 and recent_momentum >= 50) or (
+            momentum < 50 and recent_momentum < 50
+        )
+
+        passes = strong_primary and strong_secondary and same_direction
+        reason = (
+            "ok"
+            if passes
+            else f"primary={momentum:.0f}% (need {primary_threshold}%), "
+            f"secondary={recent_momentum:.0f}% (need {secondary_threshold}%), "
+            f"same_direction={same_direction}"
+        )
+
+        return passes, reason
 
     def _calculate_fair_probability(
         self, symbol: str, strike_price: float, current_price: float

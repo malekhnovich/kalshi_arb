@@ -109,7 +109,7 @@ class PriceMonitorAgent(BaseAgent):
         super().__init__("PriceMonitor", event_bus)
         self.client = BinanceClient()
         self.symbols = config.BINANCE_SYMBOLS
-        self.poll_interval = config.POLL_INTERVAL_BINANCE
+        self.poll_interval = config.PRICE_POLL_INTERVAL
         self.momentum_window = config.MOMENTUM_WINDOW
 
     async def run(self) -> None:

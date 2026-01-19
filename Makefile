@@ -1,4 +1,4 @@
-.PHONY: push tmux help test-quick test-full test-suite-quick test-suite-full optimize-quick optimize-full tsa dryrun dryrun-debug
+.PHONY: push tmux help test-quick test-full test-suite-quick test-suite-full optimize-quick optimize-full tsa dryrun dryrun-debug dryrun-test dryrun-test-debug kill-python kill-dryrun kill-all
 
 # Git commands
 gcp:
@@ -11,6 +11,25 @@ tmux:
 	@tmux has-session -t arbitrage 2>/dev/null || \
 	tmux new-session -d -s arbitrage \; split-window -h \; split-window -v \; select-pane -t 0 \; split-window -v \; select-layout tiled
 	@tmux attach-session -t arbitrage
+
+# Process management - Kill running processes
+kill-python:
+	@echo "Killing all Python processes..."
+	@pkill -f "uv run python.*run_trader\|python.*run_backtest\|python.*dryrun" || echo "No Python trading processes running"
+	@sleep 1
+	@echo "✓ Done"
+
+kill-dryrun:
+	@echo "Killing dry-run processes..."
+	@pkill -f "python.*run_trader" || echo "No dryrun processes running"
+	@sleep 1
+	@echo "✓ Done"
+
+kill-all:
+	@echo "Killing ALL Python processes in this directory..."
+	@pkill -f "python" || echo "No Python processes running"
+	@sleep 1
+	@echo "✓ Done (use with caution!)"
 
 # Quick backtest (2 days) - with baseline strategy config
 test-quick:
@@ -97,6 +116,23 @@ dryrun-debug:
 	@echo "Starting dry-run trading with debug output..."
 	@echo "Log file: logs/dryrun_debug_$(shell date +%Y%m%d_%H%M%S).log"
 	@uv run python run_trader.py --debug | tee logs/dryrun_debug_$(shell date +%Y%m%d_%H%M%S).log
+
+# TEST CONFIG: Bare minimum filters for workflow validation
+# Uses config_test.py instead of config.py
+# This is a SEPARATE configuration to test end-to-end flow
+dryrun-test:
+	@echo "Starting TEST CONFIG dry-run (bare minimum filters)..."
+	@echo "Using: config_test.py (SEPARATE TEST CONFIG)"
+	@echo "Price Monitor: Binance (default) - Override with PRICE_MONITOR_SOURCE=coingecko"
+	@echo "Log file: logs/dryrun_test_$(shell date +%Y%m%d_%H%M%S).log"
+	@uv run python run_trader.py --config config_test 2>&1 | tee logs/dryrun_test_$(shell date +%Y%m%d_%H%M%S).log
+
+dryrun-test-debug:
+	@echo "Starting TEST CONFIG dry-run with debug output (bare minimum filters)..."
+	@echo "Using: config_test.py (SEPARATE TEST CONFIG)"
+	@echo "Price Monitor: Binance (default) - Override with PRICE_MONITOR_SOURCE=coingecko"
+	@echo "Log file: logs/dryrun_test_debug_$(shell date +%Y%m%d_%H%M%S).log"
+	@uv run python run_trader.py --config config_test --debug 2>&1 | tee logs/dryrun_test_debug_$(shell date +%Y%m%d_%H%M%S).log
 
 # Check for trades in dry-run logs
 check-trades:
@@ -193,14 +229,25 @@ help:
 	@echo "Live Trading (Dry-Run):"
 	@echo "  make dryrun               - Run dry-run trading simulator (no real money)"
 	@echo "  make dryrun-debug         - Run dry-run with debug output"
+	@echo "  make dryrun-test          - TEST CONFIG (bare minimum filters for testing)"
+	@echo "  make dryrun-test-debug    - TEST CONFIG with debug output"
 	@echo "  make check-trades         - Check if trades were executed (latest log)"
 	@echo "  make check-trades-all     - Show all trades across all logs"
 	@echo "  make check-wins           - Show only winning trades"
 	@echo "  make check-losses         - Show only losing trades"
 	@echo ""
+	@echo "Price Monitor Selection:"
+	@echo "  Default: CoinGecko (free, no API key required)"
+	@echo "  Override: PRICE_MONITOR_SOURCE=binance make dryrun-test-debug"
+	@echo ""
 	@echo "Pre-Live Deployment:"
 	@echo "  make checklist            - Show quick 7-step live readiness checklist"
 	@echo "  make checklist-full       - Show comprehensive pre-live validation checklist"
+	@echo ""
+	@echo "Process Management:"
+	@echo "  make kill-dryrun          - Kill dry-run processes"
+	@echo "  make kill-python          - Kill all trading-related Python processes"
+	@echo "  make kill-all             - Kill ALL Python processes (use with caution!)"
 	@echo ""
 	@echo "Other:"
 	@echo "  make push                 - Git add, commit, and push"

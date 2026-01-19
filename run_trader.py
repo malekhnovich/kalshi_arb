@@ -19,11 +19,22 @@ Press Ctrl+C to stop gracefully.
 
 import asyncio
 import argparse
+import importlib
 import signal
 import sys
 from typing import List, Optional
 
 from events import EventBus
+
+# Parse config argument early (before importing agents) so they use the right config
+_config_module = "config"
+if "--config" in sys.argv:
+    _config_idx = sys.argv.index("--config")
+    if _config_idx + 1 < len(sys.argv):
+        _config_module = sys.argv[_config_idx + 1]
+        sys.modules['config'] = importlib.import_module(_config_module)
+
+import config
 from agents import (
     BaseAgent,
     PriceMonitorAgent,
@@ -33,7 +44,7 @@ from agents import (
     TraderAgent,
     BinanceWebSocketAgent,
 )
-import config
+from agents.coingecko_price_monitor import CoinGeckoMonitorAgent
 
 
 def check_live_trading_safety() -> tuple[bool, List[str]]:
@@ -138,11 +149,16 @@ class TradingOrchestrator:
         """Instantiate all agents including trader"""
         self.agents = []
 
-        # Binance Monitoring
-        if config.BINANCE_WS_ENABLED and BinanceWebSocketAgent:
-            self.agents.append(BinanceWebSocketAgent(self.event_bus))
+        # Price Monitoring - Select provider based on PRICE_MONITOR_SOURCE config
+        if config.PRICE_MONITOR_SOURCE == "binance":
+            # Binance.US API (can be re-enabled if connectivity is restored)
+            if config.BINANCE_WS_ENABLED and BinanceWebSocketAgent:
+                self.agents.append(BinanceWebSocketAgent(self.event_bus))
+            else:
+                self.agents.append(PriceMonitorAgent(self.event_bus))
         else:
-            self.agents.append(PriceMonitorAgent(self.event_bus))
+            # CoinGecko (default - free API, no key required)
+            self.agents.append(CoinGeckoMonitorAgent(self.event_bus))
 
         # Kalshi Monitoring
         self.agents.append(KalshiMonitorAgent(self.event_bus))
@@ -167,9 +183,10 @@ class TradingOrchestrator:
         """Start the orchestrator and all agents"""
         mode = "DRY-RUN" if self.dry_run else "LIVE"
 
+        price_source = config.PRICE_MONITOR_SOURCE.upper()
         print("\n" + "=" * 60)
         print(f"  ARBITRAGE TRADING SYSTEM - {mode} MODE")
-        print("  Binance.US <-> Kalshi")
+        print(f"  {price_source} <-> Kalshi")
         print("=" * 60)
         print(f"  Max Position Size:   ${self.max_position_size}")
         print(f"  Max Open Positions:  {self.max_open_positions}")
@@ -266,6 +283,12 @@ def main():
         description="Run the Binance-Kalshi arbitrage trading system"
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default="config",
+        help="Config module to use (default: config, or use 'config_test' for test mode)",
+    )
+    parser.add_argument(
         "--live",
         action="store_true",
         help="Enable live trading (requires safety gates - see docs)",
@@ -285,14 +308,14 @@ def main():
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=70.0,
-        help="Minimum confidence threshold (default: 70)",
+        default=50.0,
+        help="Minimum confidence threshold (default: 50 for testing)",
     )
     parser.add_argument(
         "--min-edge",
         type=float,
-        default=10.0,
-        help="Minimum edge in cents (default: 10)",
+        default=0.0,
+        help="Minimum edge in cents (default: 0.0 for testing - accept any spread)",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument(
@@ -307,6 +330,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Config was already loaded at module level if --config was specified
+    if _config_module != "config":
+        print(f"[Config] Using {_config_module}")
 
     if args.debug:
         import logging

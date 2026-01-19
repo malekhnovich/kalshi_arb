@@ -4,6 +4,7 @@ Agent package for the arbitrage detection system.
 
 from .base import BaseAgent, CircuitBreaker, retry_with_backoff
 from .price_monitor import PriceMonitorAgent
+from .coingecko_price_monitor import CoinGeckoMonitorAgent
 from .kalshi_monitor import KalshiMonitorAgent
 from .arbitrage_detector import ArbitrageDetectorAgent
 from .signal_aggregator import SignalAggregatorAgent
@@ -28,6 +29,7 @@ __all__ = [
     "CircuitBreaker",
     "retry_with_backoff",
     "PriceMonitorAgent",
+    "CoinGeckoMonitorAgent",
     "KalshiMonitorAgent",
     "ArbitrageDetectorAgent",
     "SignalAggregatorAgent",

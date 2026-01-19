@@ -44,15 +44,35 @@ def _get_env_tuple(key: str, default: Tuple[int, int]) -> Tuple[int, int]:
     return default
 
 
-# Binance.US Configuration
+# Binance.US Configuration (DEPRECATED - Replaced with CoinGecko)
+# NOTE: Binance.US API became unreliable. Now using CoinGecko for price data.
 # Env: BINANCE_API_URL
 BINANCE_US_API_URL = _get_env_str("BINANCE_API_URL", "https://api.binance.us/api/v3")
 # Env: BINANCE_SYMBOLS (comma-separated, e.g., "BTCUSDT,ETHUSDT")
 BINANCE_SYMBOLS = _get_env_list("BINANCE_SYMBOLS", ["SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT"])
-# Env: POLL_INTERVAL_BINANCE
-POLL_INTERVAL_BINANCE = _get_env_int("POLL_INTERVAL_BINANCE", 5)  # seconds
+# Price Monitor Polling Interval (applies to both CoinGecko and Binance)
+# Env: PRICE_POLL_INTERVAL (4 symbols × 1 fetch per interval = request rate)
+# 20s = 12 req/min (safe), 30s = 8 req/min (very safe)
+PRICE_POLL_INTERVAL = _get_env_int("PRICE_POLL_INTERVAL", 20)  # seconds
 # Env: BINANCE_WS_ENABLED
-BINANCE_WS_ENABLED = _get_env_str("BINANCE_WS_ENABLED", "true").lower() == "true"
+# NOTE: WebSocket publishes individual trades, not 1-minute candles. This causes momentum
+# calculation to be unreliable with insufficient data. Using polling API is more stable.
+BINANCE_WS_ENABLED = _get_env_str("BINANCE_WS_ENABLED", "false").lower() == "true"
+
+# Price Monitor Selection
+# Env: PRICE_MONITOR_SOURCE (coingecko or binance)
+# binance: Binance.US API (default - using Binance)
+# coingecko: Free API alternative if Binance is down
+PRICE_MONITOR_SOURCE = _get_env_str("PRICE_MONITOR_SOURCE", "binance").lower()
+
+# CoinGecko Configuration (Free cryptocurrency price data provider)
+# Env: COINGECKO_API_KEY (optional, for higher rate limits; free tier works without it)
+COINGECKO_API_KEY = _get_env_str("COINGECKO_API_KEY", "")
+# Env: COINGECKO_API_URL
+COINGECKO_API_URL = _get_env_str("COINGECKO_API_URL", "https://api.coingecko.com/api/v3")
+# Rate limit: Free tier = 10-50 calls/minute, with API key = higher limits
+# Env: COINGECKO_RATE_LIMIT (requests per second)
+COINGECKO_RATE_LIMIT = _get_env_float("COINGECKO_RATE_LIMIT", 0.2)  # ~12 req/min (safe for free tier)
 
 # Kalshi Configuration
 # Env: KALSHI_API_URL
@@ -118,7 +138,6 @@ MAX_DAILY_LOSS = _get_env_float("MAX_DAILY_LOSS", 30.0)
 def is_live_trading_allowed() -> bool:
     """
     Multiple safety checks before live trading is allowed.
-
     Returns True ONLY if ALL of these conditions are met:
     1. KALSHI_ENABLE_LIVE_TRADING=true environment variable is set
     2. ./ENABLE_LIVE_TRADING file exists in working directory
@@ -170,8 +189,11 @@ CONFIDENCE_THRESHOLD = _get_env_int("CONFIDENCE_THRESHOLD", 70)  # percent confi
 MIN_ODDS_SPREAD = _get_env_float("MIN_ODDS_SPREAD", 5.0)  # Minimum spread (cents)
 # Env: ODDS_NEUTRAL_RANGE (comma-separated, e.g., "45,55")
 ODDS_NEUTRAL_RANGE = _get_env_tuple("ODDS_NEUTRAL_RANGE", (45, 55))
-# Env: STRIKE_DISTANCE_THRESHOLD_PCT (within X% of strike price)
-STRIKE_DISTANCE_THRESHOLD_PCT = _get_env_float("STRIKE_DISTANCE_THRESHOLD_PCT", 0.5)
+# Env: STRIKE_DISTANCE_THRESHOLD_PCT (minimum distance from strike price)
+# Price must be at least X% AWAY from strike to trade (avoids coin-flip scenarios)
+# Higher = more selective (only trade when outcome is more certain)
+# 2% means: for $100 strike, price must be <$98 or >$102 to trade
+STRIKE_DISTANCE_THRESHOLD_PCT = _get_env_float("STRIKE_DISTANCE_THRESHOLD_PCT", 2.0)
 
 # Logging Configuration
 # Env: LOG_DIR
@@ -314,3 +336,17 @@ STAGE_1_MAX_POSITION = _get_env_float("STAGE_1_MAX_POSITION", 10.0)
 STAGE_1_DAILY_LOSS_LIMIT = _get_env_float("STAGE_1_DAILY_LOSS_LIMIT", 30.0)
 # Env: STAGE_1_MAX_DRAWDOWN_PERCENT
 STAGE_1_MAX_DRAWDOWN_PERCENT = _get_env_float("STAGE_1_MAX_DRAWDOWN_PERCENT", 10.0)
+
+# ============================================================================
+# POSITION EXIT SETTINGS
+# ============================================================================
+# Time-based exit: Positions are closed after POSITION_HOLD_DURATION seconds.
+# This captures the spread convergence that typically happens within minutes.
+
+# Env: POSITION_HOLD_DURATION (seconds to hold position before closing)
+# Default: 60 seconds - matches typical odds convergence window
+POSITION_HOLD_DURATION = _get_env_int("POSITION_HOLD_DURATION", 60)
+
+# Env: EXIT_SLIPPAGE_CENTS (expected slippage when exiting, in cents)
+# Used to estimate exit price when closing positions
+EXIT_SLIPPAGE_CENTS = _get_env_float("EXIT_SLIPPAGE_CENTS", 2.0)
